@@ -40,7 +40,7 @@ asset="${BIN}-${os}-${arch}.tar.gz"
 #   triple    — Rust target (delta, bat, yazi)
 #   rg_triple — ripgrep prefers musl on Linux
 #   goos/goarch — Go-style names (fzf)
-#   lazygit_os  — LazyGit platform names
+#   lazygit_os/lazygit_arch — LazyGit platform names
 triple=""
 rg_triple=""
 case "$os/$arch" in
@@ -64,6 +64,7 @@ esac
 case "$os" in linux) goos=linux ;; macos) goos=darwin ;; esac
 case "$arch" in x86_64) goarch=amd64 ;; aarch64) goarch=arm64 ;; esac
 case "$os" in linux) lazygit_os=Linux ;; macos) lazygit_os=Darwin ;; esac
+case "$arch" in x86_64) lazygit_arch=x86_64 ;; aarch64) lazygit_arch=arm64 ;; esac
 
 # ---- Downloader -------------------------------------------------------------
 if command -v curl >/dev/null 2>&1; then
@@ -216,7 +217,7 @@ install_yazi() {
 }
 install_lazygit() {
 	t=$(gh_latest_tag jesseduffield/lazygit) || return 1
-	install_archive "https://github.com/jesseduffield/lazygit/releases/download/${t}/lazygit_${t#v}_${lazygit_os}_${goarch}.tar.gz" lazygit tar
+	install_archive "https://github.com/jesseduffield/lazygit/releases/download/${t}/lazygit_${t#v}_${lazygit_os}_${lazygit_arch}.tar.gz" lazygit tar
 }
 
 # Offer to install a missing tool. Args: command-name  label  installer-fn  note.
@@ -230,7 +231,7 @@ offer_install() {
 		command -v "$cmd" >/dev/null 2>&1 && return 0
 	fi
 	if confirm "${label} is not installed. Install the latest from GitHub?"; then
-		"$fn" || warn "  ${note}"
+		"$fn" || err "failed to install ${label}: ${note}"
 	else
 		warn "${label} — ${note}"
 	fi

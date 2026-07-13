@@ -59,6 +59,8 @@ Press `?` at any time for this list in-app.
 | `Enter`     | Open the current hunk's file in sidecar (its diff)  |
 | `PgDn`/`PgUp`/`Space` | Page the preview                          |
 | `H`         | Jump to PROJECT-ROOT — the project-wide diff       |
+| `C`         | Toggle the left panel between all files and changes (all files by default) |
+| `.`         | Toggle hidden files (shown by default)             |
 | `S`         | Toggle the left panel (hidden ⇒ `h`/`l` do nothing) |
 | `W`         | Toggle preview line wrapping                        |
 | `1` / `2` / `3` | Diff layout: stacked / side-by-side / auto (default) |
@@ -69,6 +71,8 @@ Press `?` at any time for this list in-app.
 | `/`         | Search the **current file's diff**                 |
 | `r`         | Refresh now                                        |
 | `R`         | Toggle auto-refresh (off by default)               |
+| `z`         | Open **lazygit**                                   |
+| `Ctrl+Z`    | Suspend sidecar to the background                  |
 | `Ctrl+D`, or `Ctrl+C` `Ctrl+C` | Quit                            |
 
 Selecting a file that has changes shows its diff; an unchanged file shows its

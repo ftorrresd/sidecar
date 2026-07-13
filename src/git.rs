@@ -114,6 +114,27 @@ pub fn changed_files(root: &Path) -> Result<Vec<ChangedFile>> {
     Ok(files)
 }
 
+/// List all tracked and untracked files, excluding ignored files.
+pub fn all_files(root: &Path) -> Result<Vec<String>> {
+    let out = capture(git(root).args([
+        "-c",
+        "core.quotepath=false",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]))?;
+    let mut files: Vec<String> = out
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 /// Whether `path` is tracked by git.
 pub fn is_tracked(root: &Path, path: &str) -> bool {
     git(root)
@@ -275,6 +296,7 @@ fn no_index_diff(root: &Path, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn index_diff_records_added_and_removed_with_new_line_numbers() {
@@ -307,5 +329,28 @@ diff --git a/src/x.rs b/src/x.rs
     fn parse_hunk_new_start_reads_the_plus_side() {
         assert_eq!(parse_hunk_new_start(" -1,3 +5,6 @@ fn foo()"), 5);
         assert_eq!(parse_hunk_new_start(" -0,0 +1 @@"), 1);
+    }
+
+    #[test]
+    fn all_files_includes_tracked_and_untracked_but_not_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(git(root).args(["init", "-q"]).status().unwrap().success());
+
+        fs::write(root.join("tracked.txt"), "tracked").unwrap();
+        fs::write(root.join("untracked.txt"), "untracked").unwrap();
+        fs::write(root.join("ignored.txt"), "ignored").unwrap();
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        assert!(git(root)
+            .args(["add", "tracked.txt"])
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_file(root.join("tracked.txt")).unwrap();
+
+        assert_eq!(
+            all_files(root).unwrap(),
+            vec![".gitignore", "tracked.txt", "untracked.txt"]
+        );
     }
 }

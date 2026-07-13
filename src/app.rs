@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use signal_hook::consts::signal::SIGTSTP;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -40,6 +41,22 @@ enum View {
 enum Focus {
     Left,
     Right,
+}
+
+/// Which set of repository files is visible in the left panel.
+#[derive(Clone, Copy, PartialEq)]
+enum FileListMode {
+    All,
+    Changes,
+}
+
+impl FileListMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All files",
+            Self::Changes => "Changes",
+        }
+    }
 }
 
 /// Cursor + visual-selection state for the annotate (note) view.
@@ -204,6 +221,9 @@ impl DiffMode {
 pub struct App {
     root: PathBuf,
     files: Vec<ChangedFile>,
+    all_files: Vec<String>,
+    file_list_mode: FileListMode,
+    show_hidden: bool,
     list_state: ListState,
     view: View,
     preview: Text<'static>,
@@ -255,12 +275,16 @@ pub struct App {
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         let files = git::changed_files(&root).unwrap_or_default();
+        let all_files = git::all_files(&root).unwrap_or_default();
         let notes = notes::load_all(&root);
         let mut list_state = ListState::default();
         list_state.select(Some(0)); // HOME row
         let mut app = Self {
             root,
             files,
+            all_files,
+            file_list_mode: FileListMode::All,
+            show_hidden: true,
             list_state,
             view: View::Home,
             preview: Text::raw(""),
@@ -347,14 +371,15 @@ impl App {
         Ok(())
     }
 
-    /// Rebuild the changed-file list, preserving the selected path when possible.
+    /// Rebuild the file lists, preserving the selected path when possible.
     fn reload(&mut self) {
-        let selected_path = self.selected_changed_path();
+        let selected_path = self.selected_path();
         self.files = git::changed_files(&self.root).unwrap_or_default();
+        self.all_files = git::all_files(&self.root).unwrap_or_default();
 
         // Restore selection by path, else clamp into range.
         let new_index = selected_path
-            .and_then(|p| self.files.iter().position(|f| f.path == p))
+            .and_then(|p| self.visible_position(&p))
             .map(|i| i + 1)
             .unwrap_or(0);
         self.list_state
@@ -387,26 +412,73 @@ impl App {
         }
     }
 
-    /// Path of the currently selected changed file (None for HOME row).
-    fn selected_changed_path(&self) -> Option<String> {
+    /// Path of the currently selected file (None for HOME row).
+    fn selected_path(&self) -> Option<String> {
         match self.list_state.selected() {
             Some(0) | None => None,
-            Some(i) => self.files.get(i - 1).map(|f| f.path.clone()),
+            Some(i) => self.visible_path(i - 1).map(str::to_owned),
         }
     }
 
-    /// Number of rows in the list (HOME + one per changed file).
+    fn visible_file_count(&self) -> usize {
+        match self.file_list_mode {
+            FileListMode::All => self
+                .all_files
+                .iter()
+                .filter(|path| self.show_hidden || !is_hidden_path(path))
+                .count(),
+            FileListMode::Changes => self
+                .files
+                .iter()
+                .filter(|file| self.show_hidden || !is_hidden_path(&file.path))
+                .count(),
+        }
+    }
+
+    fn visible_path(&self, index: usize) -> Option<&str> {
+        match self.file_list_mode {
+            FileListMode::All => self
+                .all_files
+                .iter()
+                .filter(|path| self.show_hidden || !is_hidden_path(path))
+                .nth(index)
+                .map(String::as_str),
+            FileListMode::Changes => self
+                .files
+                .iter()
+                .filter(|file| self.show_hidden || !is_hidden_path(&file.path))
+                .nth(index)
+                .map(|file| file.path.as_str()),
+        }
+    }
+
+    fn visible_position(&self, path: &str) -> Option<usize> {
+        match self.file_list_mode {
+            FileListMode::All => self
+                .all_files
+                .iter()
+                .filter(|file| self.show_hidden || !is_hidden_path(file))
+                .position(|file| file == path),
+            FileListMode::Changes => self
+                .files
+                .iter()
+                .filter(|file| self.show_hidden || !is_hidden_path(&file.path))
+                .position(|file| file.path == path),
+        }
+    }
+
+    /// Number of rows in the list (HOME + one per visible file).
     fn row_count(&self) -> usize {
-        self.files.len() + 1
+        self.visible_file_count() + 1
     }
 
     /// Set the view from the current list selection and reset scroll.
     fn sync_view_from_list(&mut self) {
         self.view = match self.list_state.selected() {
             Some(0) | None => View::Home,
-            Some(i) => match self.files.get(i - 1) {
-                Some(f) => View::File {
-                    path: PathBuf::from(&f.path),
+            Some(i) => match self.visible_path(i - 1) {
+                Some(path) => View::File {
+                    path: PathBuf::from(path),
                     line: None,
                 },
                 None => View::Home,
@@ -765,6 +837,10 @@ impl App {
             }
             return Ok(());
         }
+        if ctrl && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z')) {
+            tui::suspend(terminal, || signal_hook::low_level::raise(SIGTSTP))??;
+            return Ok(());
+        }
         // Any other key cancels a pending Ctrl+C and clears the status line.
         self.pending_quit = None;
         self.message.clear();
@@ -830,6 +906,10 @@ impl App {
                     Focus::Right
                 };
             }
+
+            // Toggle the files shown in the left panel.
+            KeyCode::Char('C') => self.toggle_file_list_mode(),
+            KeyCode::Char('.') => self.toggle_hidden_files(),
 
             // Toggle preview line wrapping
             KeyCode::Char('W') => {
@@ -1004,6 +1084,36 @@ impl App {
         self.message = format!(
             "auto-refresh: {}",
             if self.auto_refresh { "on" } else { "off" }
+        );
+    }
+
+    fn toggle_file_list_mode(&mut self) {
+        let selected_path = self.selected_path();
+        self.file_list_mode = match self.file_list_mode {
+            FileListMode::All => FileListMode::Changes,
+            FileListMode::Changes => FileListMode::All,
+        };
+        let selected = selected_path
+            .and_then(|path| self.visible_position(&path))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.list_state.select(Some(selected));
+        self.sync_view_from_list();
+        self.message = format!("files: {}", self.file_list_mode.label());
+    }
+
+    fn toggle_hidden_files(&mut self) {
+        let selected_path = self.selected_path();
+        self.show_hidden = !self.show_hidden;
+        let selected = selected_path
+            .and_then(|path| self.visible_position(&path))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        self.list_state.select(Some(selected));
+        self.sync_view_from_list();
+        self.message = format!(
+            "hidden files: {}",
+            if self.show_hidden { "shown" } else { "hidden" }
         );
     }
 
@@ -1546,8 +1656,8 @@ impl App {
     /// Point the view at an arbitrary file (from yazi/fzf/search).
     fn open_path(&mut self, path: PathBuf, line: Option<usize>) {
         let rel = path.to_string_lossy().to_string();
-        // Highlight it in the list if it's a tracked change; else clear.
-        match self.files.iter().position(|f| f.path == rel) {
+        // Highlight it when it is present in the current list; else clear.
+        match self.visible_position(&rel) {
             Some(i) => self.list_state.select(Some(i + 1)),
             None => self.list_state.select(None),
         }
@@ -1724,15 +1834,24 @@ impl App {
     fn desired_left_width(&self, total: u16) -> u16 {
         // marker + space + path, and the PROJECT-ROOT row / list title.
         let mut content = ROOT_LABEL.chars().count();
-        content = content.max(format!(" Changes ({}) ", self.files.len()).chars().count());
-        for file in &self.files {
+        content = content.max(
+            format!(
+                " {} ({}) ",
+                self.file_list_mode.label(),
+                self.visible_file_count()
+            )
+            .chars()
+            .count(),
+        );
+        for index in 0..self.visible_file_count() {
+            let path = self.visible_path(index).unwrap_or_default();
             let badge = self
                 .notes
-                .get(&file.path)
+                .get(path)
                 .filter(|n| !n.is_empty())
                 .map(|n| 3 + n.len().to_string().len())
                 .unwrap_or(0);
-            content = content.max(2 + file.path.chars().count() + badge);
+            content = content.max(2 + path.chars().count() + badge);
         }
         // + highlight symbol ("▶ ") + borders + a column of padding.
         let want = content as u16 + 2 + 2 + 1;
@@ -1759,8 +1878,14 @@ impl App {
             ),
         ])));
 
-        for file in &self.files {
-            let marker = file.marker();
+        for index in 0..self.visible_file_count() {
+            let path = self.visible_path(index).unwrap_or_default();
+            let marker = self
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .map(ChangedFile::marker)
+                .unwrap_or(' ');
             let color = match marker {
                 'A' | '?' => Color::Green,
                 'D' => Color::Red,
@@ -1770,9 +1895,9 @@ impl App {
             };
             let mut spans = vec![
                 Span::styled(format!("{marker} "), Style::default().fg(color)),
-                Span::raw(file.path.clone()),
+                Span::raw(path.to_owned()),
             ];
-            if let Some(n) = self.notes.get(&file.path) {
+            if let Some(n) = self.notes.get(path) {
                 if !n.is_empty() {
                     spans.push(Span::styled(
                         format!("  ✎{}", n.len()),
@@ -1783,7 +1908,11 @@ impl App {
             items.push(ListItem::new(Line::from(spans)));
         }
 
-        let title = format!(" Changes ({}) ", self.files.len());
+        let title = format!(
+            " {} ({}) ",
+            self.file_list_mode.label(),
+            self.visible_file_count()
+        );
         let list = List::new(items)
             .block(
                 Block::default()
@@ -1842,7 +1971,7 @@ impl App {
 
     fn draw_footer(&mut self, f: &mut Frame, area: Rect) {
         let dim = Style::default().fg(Color::DarkGray);
-        let help = "? help · h/l focus · j/k move · [ ] hunk · ⏎ open · v/n annotate · e edit · / s search · ^C ^C / ^D quit";
+        let help = "? help · C files · . hidden · h/l focus · j/k move · [ ] hunk · ⏎ open · v/n annotate · e edit · ^Z bg · ^C ^C / ^D quit";
         let annotate_help =
             "annotate · hjkl/wbe/{}[] move · / find · v/V select · y copy · c comment · d delete · n/Esc exit";
         let line = if let Some(q) = &self.find {
@@ -1880,6 +2009,8 @@ impl App {
             ("Enter", "open current hunk's file in sidecar"),
             ("PgUp/PgDn/Space", "page the preview"),
             ("H", "jump to PROJECT-ROOT (whole-project diff)"),
+            ("C", "toggle all files / changes (all files by default)"),
+            (".", "toggle hidden files (shown by default)"),
             ("S", "toggle the left (files) panel"),
             ("W", "toggle preview line wrapping"),
             ("1 / 2 / 3", "diff layout: stacked / side-by-side / auto"),
@@ -1917,6 +2048,7 @@ impl App {
             ("s / /", "search project / current-file diff"),
             ("r / R", "refresh now / toggle auto-refresh"),
             ("?", "toggle this help"),
+            ("Ctrl+Z", "suspend sidecar to the background"),
             ("Ctrl+D / Ctrl+C Ctrl+C", "quit"),
         ];
 
@@ -2212,6 +2344,10 @@ fn contains(area: Rect, col: u16, row: u16) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
 }
 
+fn is_hidden_path(path: &str) -> bool {
+    path.split('/').any(|part| part.starts_with('.'))
+}
+
 /// A centered rect of the given size within `area`.
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -2275,4 +2411,18 @@ fn parse_hunk_header(line: &str) -> Option<usize> {
 /// Clean a delta file-header path, taking the new name across a rename arrow.
 fn clean_path(s: &str) -> String {
     s.rsplit(['→', '⟶']).next().unwrap_or(s).trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_hidden_path;
+
+    #[test]
+    fn hidden_path_detects_dot_prefixed_components() {
+        assert!(is_hidden_path(".env"));
+        assert!(is_hidden_path(".github/workflows/release.yml"));
+        assert!(is_hidden_path("src/.generated/file.rs"));
+        assert!(!is_hidden_path("src/main.rs"));
+        assert!(!is_hidden_path("src/file.test.rs"));
+    }
 }

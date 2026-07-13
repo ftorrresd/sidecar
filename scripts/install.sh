@@ -40,6 +40,7 @@ asset="${BIN}-${os}-${arch}.tar.gz"
 #   triple    — Rust target (delta, bat, yazi)
 #   rg_triple — ripgrep prefers musl on Linux
 #   goos/goarch — Go-style names (fzf)
+#   lazygit_os  — LazyGit platform names
 triple=""
 rg_triple=""
 case "$os/$arch" in
@@ -62,6 +63,7 @@ macos/aarch64)
 esac
 case "$os" in linux) goos=linux ;; macos) goos=darwin ;; esac
 case "$arch" in x86_64) goarch=amd64 ;; aarch64) goarch=arm64 ;; esac
+case "$os" in linux) lazygit_os=Linux ;; macos) lazygit_os=Darwin ;; esac
 
 # ---- Downloader -------------------------------------------------------------
 if command -v curl >/dev/null 2>&1; then
@@ -212,6 +214,10 @@ install_yazi() {
 	t=$(gh_latest_tag sxyazi/yazi) || return 1
 	install_archive "https://github.com/sxyazi/yazi/releases/download/${t}/yazi-${triple}.zip" yazi zip
 }
+install_lazygit() {
+	t=$(gh_latest_tag jesseduffield/lazygit) || return 1
+	install_archive "https://github.com/jesseduffield/lazygit/releases/download/${t}/lazygit_${t#v}_${lazygit_os}_${goarch}.tar.gz" lazygit tar
+}
 
 # Offer to install a missing tool. Args: command-name  label  installer-fn  note.
 # SIDECAR_FORCE_DEPS=1 installs even when the tool is already present (CI test).
@@ -237,6 +243,7 @@ offer_install bat bat install_bat "needed at runtime: https://github.com/sharkdp
 offer_install rg ripgrep install_rg "used by search: https://github.com/BurntSushi/ripgrep/releases"
 offer_install fzf fzf install_fzf "used by the file/diff pickers: https://github.com/junegunn/fzf/releases"
 offer_install yazi yazi install_yazi "used by the yazi file picker: https://github.com/sxyazi/yazi/releases"
+offer_install lazygit lazygit install_lazygit "used by the lazygit shortcut: https://github.com/jesseduffield/lazygit/releases"
 
 # git has no convenient single-binary release — use the system package manager.
 command -v git >/dev/null 2>&1 ||

@@ -1,0 +1,26 @@
+[package]
+name = "runk"
+version = "0.1.0"
+edition = "2021"
+description = "Review-first terminal diff viewer"
+
+[[bin]]
+name = "runk"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+similar = "2"
+git2 = "0.19"
+syntect = { version = "5", default-features = false, features = ["default-fancy", "parsing", "regex-onig", "default-themes", "default-syntaxes"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

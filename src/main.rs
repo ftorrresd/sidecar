@@ -12,6 +12,8 @@ mod render;
 mod skill;
 mod tui;
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use anyhow::{bail, Context, Result};
 use std::env;
 use std::path::PathBuf;
@@ -30,6 +32,11 @@ fn main() -> Result<()> {
 fn real_main() -> Result<()> {
     // First positional arg is either a subcommand or a directory to open.
     let first = env::args().nth(1);
+
+    if first.as_deref() == Some("--version") {
+        println!("sidecar {VERSION}");
+        return Ok(());
+    }
 
     // `sidecar skill [path]` dumps the notes SKILL.md and prints its directory,
     // so a coding agent can install it and learn the `.sidecar/*.json` format.

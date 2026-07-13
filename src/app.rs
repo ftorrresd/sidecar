@@ -2085,7 +2085,7 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .title(" Keybindings ");
+            .title(format!(" Keybindings · sidecar {} ", crate::VERSION));
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(lines).block(block), area);
     }

@@ -7,6 +7,7 @@
 #   SIDECAR_VERSION       tag to install (default: latest release)
 #   SIDECAR_BIN_DIR       install directory (default: $HOME/.local/bin)
 #   SIDECAR_INSTALL_DEPS  1 = auto-install missing deps, 0 = never (default: ask)
+#   GITHUB_TOKEN          optional token for GitHub API rate limits
 
 set -eu
 
@@ -66,18 +67,38 @@ case "$arch" in x86_64) goarch=amd64 ;; aarch64) goarch=arm64 ;; esac
 if command -v curl >/dev/null 2>&1; then
 	fetch() { curl -fsSL "$1"; }
 	fetch_to() { curl -fsSL "$1" -o "$2"; }
+	fetch_api() {
+		if [ -n "${GITHUB_TOKEN:-}" ]; then
+			curl -fsSL -H "Authorization: Bearer ${GITHUB_TOKEN}" "$1"
+		else
+			curl -fsSL "$1"
+		fi
+	}
 elif command -v wget >/dev/null 2>&1; then
 	fetch() { wget -qO- "$1"; }
 	fetch_to() { wget -qO "$2" "$1"; }
+	fetch_api() {
+		if [ -n "${GITHUB_TOKEN:-}" ]; then
+			wget -qO- --header="Authorization: Bearer ${GITHUB_TOKEN}" "$1"
+		else
+			wget -qO- "$1"
+		fi
+	}
 else
 	err "need either curl or wget installed"
 fi
 
 # The latest release tag of a GitHub repo (e.g. "0.18.2" or "v0.24.0").
 gh_latest_tag() {
-	fetch "https://api.github.com/repos/$1/releases/latest" |
+	repo=$1
+	tag=$(fetch_api "https://api.github.com/repos/${repo}/releases/latest" |
 		grep '"tag_name"' | head -n1 |
-		sed -E 's/.*"tag_name": *"([^"]+)".*/\1/'
+		sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+	[ -n "$tag" ] || {
+		warn "  could not determine latest release for ${repo}" >&2
+		return 1
+	}
+	printf '%s\n' "$tag"
 }
 
 # Prompt for yes/no (reading the real terminal, since stdin may be the pipe).
@@ -104,9 +125,8 @@ if [ "${SIDECAR_DEPS_ONLY:-0}" != 1 ]; then
 	tag="${SIDECAR_VERSION:-}"
 	if [ -z "$tag" ]; then
 		info "Finding the latest sidecar release..."
-		tag=$(gh_latest_tag "$REPO")
+		tag=$(gh_latest_tag "$REPO") || err "could not determine the latest release (set SIDECAR_VERSION to override)"
 	fi
-	[ -n "$tag" ] || err "could not determine the latest release (set SIDECAR_VERSION to override)"
 
 	url="https://github.com/${REPO}/releases/download/${tag}/${asset}"
 	tmp=$(mktemp -d)
@@ -173,23 +193,23 @@ install_archive() {
 
 # Per-tool installers (each release names its assets differently).
 install_delta() {
-	t=$(gh_latest_tag dandavison/delta)
+	t=$(gh_latest_tag dandavison/delta) || return 1
 	install_archive "https://github.com/dandavison/delta/releases/download/${t}/delta-${t}-${triple}.tar.gz" delta tar
 }
 install_bat() {
-	t=$(gh_latest_tag sharkdp/bat)
+	t=$(gh_latest_tag sharkdp/bat) || return 1
 	install_archive "https://github.com/sharkdp/bat/releases/download/${t}/bat-${t}-${triple}.tar.gz" bat tar
 }
 install_rg() {
-	t=$(gh_latest_tag BurntSushi/ripgrep)
+	t=$(gh_latest_tag BurntSushi/ripgrep) || return 1
 	install_archive "https://github.com/BurntSushi/ripgrep/releases/download/${t}/ripgrep-${t}-${rg_triple}.tar.gz" rg tar
 }
 install_fzf() {
-	t=$(gh_latest_tag junegunn/fzf)
+	t=$(gh_latest_tag junegunn/fzf) || return 1
 	install_archive "https://github.com/junegunn/fzf/releases/download/${t}/fzf-${t#v}-${goos}_${goarch}.tar.gz" fzf tar
 }
 install_yazi() {
-	t=$(gh_latest_tag sxyazi/yazi)
+	t=$(gh_latest_tag sxyazi/yazi) || return 1
 	install_archive "https://github.com/sxyazi/yazi/releases/download/${t}/yazi-${triple}.zip" yazi zip
 }
 

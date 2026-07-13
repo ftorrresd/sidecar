@@ -73,6 +73,7 @@ jobs:
           SIDECAR_DEPS_ONLY: "1" # don't try to fetch a sidecar release
           SIDECAR_INSTALL_DEPS: "1" # non-interactive: answer "yes"
           SIDECAR_FORCE_DEPS: "1" # install even if the runner already has them
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           export SIDECAR_BIN_DIR="$RUNNER_TEMP/deps"

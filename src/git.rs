@@ -22,12 +22,12 @@ impl ChangedFile {
     pub fn marker(&self) -> char {
         let s = self.status.as_bytes();
         match (s.first().copied(), s.get(1).copied()) {
-            (Some(b'?'), _) => '?',            // untracked
-            (Some(b'A'), _) => 'A',            // added
+            (Some(b'?'), _) => '?',                   // untracked
+            (Some(b'A'), _) => 'A',                   // added
             (Some(b'D'), _) | (_, Some(b'D')) => 'D', // deleted
-            (Some(b'R'), _) => 'R',            // renamed
-            (Some(b' '), Some(b'M')) => 'M',   // modified, unstaged
-            (Some(b'M'), _) => 'M',            // modified, staged
+            (Some(b'R'), _) => 'R',                   // renamed
+            (Some(b' '), Some(b'M')) => 'M',          // modified, unstaged
+            (Some(b'M'), _) => 'M',                   // modified, staged
             _ => '~',
         }
     }
@@ -95,7 +95,9 @@ pub fn changed_files(root: &Path) -> Result<Vec<ChangedFile>> {
         "core.quotepath=false",
         "status",
         "--porcelain=v1",
-        "--untracked-files=normal",
+        // `all` (not `normal`) so untracked *files* are listed individually
+        // rather than collapsed into their parent directory (e.g. `.github/`).
+        "--untracked-files=all",
         "--no-renames",
     ]))?;
 
@@ -145,13 +147,19 @@ pub fn project_diff_raw(root: &Path) -> Result<String> {
     let mut out = String::new();
 
     if has_head(root) {
-        out.push_str(&capture(
-            git_diff(root).args(["diff", "--no-color", "HEAD", "--"]),
-        )?);
+        out.push_str(&capture(git_diff(root).args([
+            "diff",
+            "--no-color",
+            "HEAD",
+            "--",
+        ]))?);
     } else {
-        out.push_str(&capture(
-            git_diff(root).args(["diff", "--no-color", "--cached", "--"]),
-        )?);
+        out.push_str(&capture(git_diff(root).args([
+            "diff",
+            "--no-color",
+            "--cached",
+            "--",
+        ]))?);
     }
 
     for path in untracked_files(root)? {
@@ -250,6 +258,20 @@ fn parse_hunk_new_start(rest: &str) -> usize {
         .unwrap_or(1)
 }
 
+/// Render an untracked file as a `git diff --no-index` addition.
+///
+/// This intentionally ignores the exit status: `--no-index` returns 1 whenever
+/// the inputs differ (always, since we compare against /dev/null).
+fn no_index_diff(root: &Path, path: &str) -> String {
+    let output = git_diff(root)
+        .args(["diff", "--no-color", "--no-index", "--", "/dev/null", path])
+        .output();
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,19 +307,5 @@ diff --git a/src/x.rs b/src/x.rs
     fn parse_hunk_new_start_reads_the_plus_side() {
         assert_eq!(parse_hunk_new_start(" -1,3 +5,6 @@ fn foo()"), 5);
         assert_eq!(parse_hunk_new_start(" -0,0 +1 @@"), 1);
-    }
-}
-
-/// Render an untracked file as a `git diff --no-index` addition.
-///
-/// This intentionally ignores the exit status: `--no-index` returns 1 whenever
-/// the inputs differ (always, since we compare against /dev/null).
-fn no_index_diff(root: &Path, path: &str) -> String {
-    let output = git_diff(root)
-        .args(["diff", "--no-color", "--no-index", "--", "/dev/null", path])
-        .output();
-    match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => String::new(),
     }
 }

@@ -7,7 +7,9 @@
 mod app;
 mod external;
 mod git;
+mod notes;
 mod render;
+mod skill;
 mod tui;
 
 use anyhow::{bail, Context, Result};
@@ -26,13 +28,21 @@ fn main() -> Result<()> {
 }
 
 fn real_main() -> Result<()> {
+    // First positional arg is either a subcommand or a directory to open.
+    let first = env::args().nth(1);
+
+    // `sidecar skill [path]` dumps the notes SKILL.md and prints its directory,
+    // so a coding agent can install it and learn the `.sidecar/*.json` format.
+    if first.as_deref() == Some("skill") {
+        let dir = skill::dump()?;
+        println!("{}", dir.display());
+        return Ok(());
+    }
+
     ensure_tools()?;
 
     // Optional positional arg: a directory to start in.
-    let start = env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?);
+    let start = first.map(PathBuf::from).unwrap_or(env::current_dir()?);
 
     let root = git::top_level(&start)
         .with_context(|| format!("{} is not inside a git repository", start.display()))?;
@@ -49,7 +59,11 @@ fn real_main() -> Result<()> {
 /// only if/when their key is pressed.
 fn ensure_tools() -> Result<()> {
     const REQUIRED: [&str; 3] = ["git", "delta", "bat"];
-    let missing: Vec<&str> = REQUIRED.iter().copied().filter(|t| !tool_exists(t)).collect();
+    let missing: Vec<&str> = REQUIRED
+        .iter()
+        .copied()
+        .filter(|t| !tool_exists(t))
+        .collect();
     if !missing.is_empty() {
         bail!(
             "missing required tools: {}. On Arch: sudo pacman -S --needed git git-delta bat \

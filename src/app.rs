@@ -8,13 +8,15 @@ use crossterm::event::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::external::{self, Hit};
 use crate::git::{self, ChangedFile};
+use crate::notes::{self, Note, SelKind};
 use crate::render;
 use crate::tui::{self, Tui};
 
@@ -38,6 +40,127 @@ enum View {
 enum Focus {
     Left,
     Right,
+}
+
+/// Cursor + visual-selection state for the annotate (note) view.
+#[derive(Clone)]
+struct CursorState {
+    /// 1-based file line.
+    line: usize,
+    /// 0-based character column into the tab-expanded line (may equal the line
+    /// length, i.e. resting just past the last character).
+    col: usize,
+    /// Visual-selection anchor (1-based line, 0-based col); `None` unless a
+    /// `v`/`V` selection is in progress.
+    anchor: Option<(usize, usize)>,
+    /// Character- vs line-wise selection (meaningful while `anchor` is set).
+    kind: SelKind,
+}
+
+/// A note comment being typed in (a new note, or an edit of an existing one).
+struct InputState {
+    buffer: String,
+    /// Insertion point, as a character index into `buffer`.
+    cursor: usize,
+    kind: SelKind,
+    start: (usize, usize),
+    end: (usize, usize),
+    /// Id of the note being edited; `None` when composing a new one.
+    editing: Option<u64>,
+}
+
+impl InputState {
+    fn char_len(&self) -> usize {
+        self.buffer.chars().count()
+    }
+
+    /// Byte offset of character index `idx` (or the end of the buffer).
+    fn byte_at(&self, idx: usize) -> usize {
+        self.buffer
+            .char_indices()
+            .nth(idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.buffer.len())
+    }
+
+    fn insert(&mut self, c: char) {
+        let b = self.byte_at(self.cursor);
+        self.buffer.insert(b, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let (s, e) = (self.byte_at(self.cursor - 1), self.byte_at(self.cursor));
+        self.buffer.replace_range(s..e, "");
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.char_len() {
+            return;
+        }
+        let (s, e) = (self.byte_at(self.cursor), self.byte_at(self.cursor + 1));
+        self.buffer.replace_range(s..e, "");
+    }
+
+    /// Cursor position as (line, column), both 0-based.
+    fn line_col(&self) -> (usize, usize) {
+        let mut line = 0;
+        let mut col = 0;
+        for ch in self.buffer.chars().take(self.cursor) {
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    /// Character index of (line, col), clamping col to the line's length.
+    fn index_of(&self, line: usize, col: usize) -> usize {
+        let mut idx = 0;
+        for (li, l) in self.buffer.split('\n').enumerate() {
+            let len = l.chars().count();
+            if li == line {
+                return idx + col.min(len);
+            }
+            idx += len + 1; // + newline
+        }
+        self.char_len()
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_len());
+    }
+    fn up(&mut self) {
+        let (l, c) = self.line_col();
+        self.cursor = if l > 0 { self.index_of(l - 1, c) } else { 0 };
+    }
+    fn down(&mut self) {
+        let (l, c) = self.line_col();
+        let n = self.buffer.split('\n').count();
+        self.cursor = if l + 1 < n {
+            self.index_of(l + 1, c)
+        } else {
+            self.char_len()
+        };
+    }
+    fn home(&mut self) {
+        let (l, _) = self.line_col();
+        self.cursor = self.index_of(l, 0);
+    }
+    fn end(&mut self) {
+        let (l, _) = self.line_col();
+        self.cursor = self.index_of(l, usize::MAX);
+    }
 }
 
 /// How diffs are laid out (delta rendering).
@@ -105,15 +228,37 @@ pub struct App {
     preview_area: Rect,
     /// Timestamp of the last Ctrl+C, for the two-press exit.
     pending_quit: Option<Instant>,
+    /// Anchored review notes, keyed by repo-relative path.
+    notes: HashMap<String, Vec<Note>>,
+    /// Whether the right pane shows the plain, note-aware annotate view.
+    annotate: bool,
+    /// Cursor/selection state while annotating (`Some` iff `annotate`).
+    cursor: Option<CursorState>,
+    /// Tab-expanded lines of the file currently shown in the annotate view.
+    annotate_lines: Vec<String>,
+    /// Column (within a preview line) where content begins after the gutter, for
+    /// mapping mouse clicks to file columns in the annotate view.
+    annotate_gutter: usize,
+    /// Anchor (file line, col) of an in-progress mouse selection.
+    mouse_anchor: Option<(usize, usize)>,
+    /// Whether the last left-press landed on the preview pane (arms mouse drag).
+    mouse_down_preview: bool,
+    /// A note comment being typed in (`c`), if any.
+    input: Option<InputState>,
+    /// In-annotate text search: the query being typed (`/`), if active.
+    find: Option<String>,
+    /// The last committed in-annotate search query, for repeat searches.
+    last_find: Option<String>,
     quit: bool,
 }
 
 impl App {
     pub fn new(root: PathBuf) -> Result<Self> {
         let files = git::changed_files(&root).unwrap_or_default();
+        let notes = notes::load_all(&root);
         let mut list_state = ListState::default();
         list_state.select(Some(0)); // HOME row
-        Ok(Self {
+        let mut app = Self {
             root,
             files,
             list_state,
@@ -134,8 +279,21 @@ impl App {
             list_area: Rect::default(),
             preview_area: Rect::default(),
             pending_quit: None,
+            notes,
+            annotate: false,
+            cursor: None,
+            annotate_lines: Vec::new(),
+            annotate_gutter: 0,
+            mouse_anchor: None,
+            mouse_down_preview: false,
+            input: None,
+            find: None,
+            last_find: None,
             quit: false,
-        })
+        };
+        // Drop/re-anchor notes that no longer match their file's current content.
+        app.refresh_notes();
+        Ok(app)
     }
 
     /// Main loop.
@@ -199,8 +357,34 @@ impl App {
             .and_then(|p| self.files.iter().position(|f| f.path == p))
             .map(|i| i + 1)
             .unwrap_or(0);
-        self.list_state.select(Some(new_index.min(self.row_count() - 1)));
+        self.list_state
+            .select(Some(new_index.min(self.row_count() - 1)));
+        self.refresh_notes();
         self.needs_render = true;
+    }
+
+    /// Re-anchor every note against its file's current content, dropping any that
+    /// no longer match, and persist the ones that moved. Runs on each refresh so
+    /// notes track the coding agent's edits.
+    fn refresh_notes(&mut self) {
+        let root = self.root.clone();
+        let mut empties = Vec::new();
+        for (rel, ns) in self.notes.iter_mut() {
+            let content = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
+            let lines = notes::canon_lines(&content);
+            let before: Vec<_> = ns.iter().map(coords).collect();
+            ns.retain_mut(|n| notes::revalidate(n, &lines));
+            let after: Vec<_> = ns.iter().map(coords).collect();
+            if before != after {
+                let _ = notes::save(&root, rel, ns);
+            }
+            if ns.is_empty() {
+                empties.push(rel.clone());
+            }
+        }
+        for rel in empties {
+            self.notes.remove(&rel);
+        }
     }
 
     /// Path of the currently selected changed file (None for HOME row).
@@ -229,7 +413,29 @@ impl App {
             },
         };
         self.scroll = 0;
+        self.reset_annotate_for_view();
         self.needs_render = true;
+    }
+
+    /// Reset cursor/input state when the previewed file changes. Files that
+    /// already carry notes open straight into the annotate view so the notes are
+    /// visible next to their locations; everything else opens in the diff view.
+    fn reset_annotate_for_view(&mut self) {
+        self.cursor = None;
+        self.input = None;
+        self.annotate = false;
+        if let View::File { path, line } = &self.view {
+            let rel = path.to_string_lossy().to_string();
+            if self.notes.get(&rel).is_some_and(|n| !n.is_empty()) {
+                self.annotate = true;
+                self.cursor = Some(CursorState {
+                    line: line.unwrap_or(1).max(1),
+                    col: 0,
+                    anchor: None,
+                    kind: SelKind::Char,
+                });
+            }
+        }
     }
 
     /// Whether the current diff mode + width resolves to side-by-side.
@@ -243,6 +449,15 @@ impl App {
 
     /// Render the preview text for the current view.
     fn render_preview(&mut self) {
+        // The annotate view has its own line-exact renderer so the cursor and
+        // notes map precisely to file coordinates.
+        if self.annotate {
+            if let View::File { path, .. } = &self.view {
+                let rel = path.to_string_lossy().to_string();
+                self.render_annotate(&rel);
+                return;
+            }
+        }
         let width = self.preview_width.max(20);
         let sbs = self.side_by_side();
         let wrap = self.wrap;
@@ -289,6 +504,217 @@ impl App {
             self.scroll_to_line(l);
         }
         self.clamp_scroll();
+    }
+
+    /// Render the note-aware view of `rel`: one preview line per file line, over
+    /// a syntax-highlighted base (via `bat`) with a line-number gutter, note
+    /// markers/comments, and the cursor and any live selection overlaid.
+    fn render_annotate(&mut self, rel: &str) {
+        let content = std::fs::read_to_string(self.root.join(rel)).unwrap_or_default();
+        self.annotate_lines = notes::canon_lines(&content);
+        let total = self.annotate_lines.len();
+
+        // Keep the cursor inside the (possibly just-changed) file.
+        if let Some(cur) = &mut self.cursor {
+            if total == 0 {
+                cur.line = 1;
+                cur.col = 0;
+            } else {
+                cur.line = cur.line.clamp(1, total);
+                let len = self.annotate_lines[cur.line - 1].chars().count();
+                cur.col = cur.col.min(len);
+            }
+        }
+
+        let file_notes = self.notes.get(rel).cloned().unwrap_or_default();
+        let gutter_style = Style::default().fg(Color::DarkGray);
+        let comment_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::ITALIC);
+        let gutter_w = total.max(1).to_string().len();
+
+        // Syntax-highlighted base; must yield at least one rendered row per file
+        // line for the gutter parsing to line up, else fall back to a plain view.
+        let width = self.preview_width.max(20);
+        let hl = if total > 0 {
+            render::highlight(&self.annotate_lines.join("\n"), rel, width)
+        } else {
+            Text::default()
+        };
+        let use_hl = total > 0 && hl.lines.len() >= total;
+
+        let mut out: Vec<Line> = Vec::with_capacity(total.max(1));
+        let mut gutter_cols = 0usize;
+        for i0 in 0..total {
+            let lineno = i0 + 1;
+            let nchars = self.annotate_lines[i0].chars().count();
+            let starts_here: Vec<&Note> = file_notes
+                .iter()
+                .filter(|n| n.start_line == lineno)
+                .collect();
+
+            // Base cells `(char, style)` plus the column where content starts.
+            let (mut cells, content_start) = if use_hl {
+                let flat = flatten_line(&hl.lines[i0]);
+                let cs = gutter_end(&flat);
+                (flat, cs)
+            } else {
+                let gutter = format!(" {lineno:>gutter_w$} │ ");
+                let cs = gutter.chars().count();
+                let mut cells: Vec<(char, Style)> =
+                    gutter.chars().map(|c| (c, gutter_style)).collect();
+                cells.extend(
+                    self.annotate_lines[i0]
+                        .chars()
+                        .map(|c| (c, Style::default())),
+                );
+                (cells, cs)
+            };
+            gutter_cols = content_start;
+
+            // Note marker in the leftmost gutter cell.
+            if !starts_here.is_empty() {
+                if let Some(first) = cells.first_mut() {
+                    *first = ('●', Style::default().fg(Color::Cyan));
+                }
+            }
+
+            // Overlay cursor/selection/note styling onto the content cells,
+            // preserving the syntax color underneath.
+            for c0 in 0..nchars {
+                if let Some(ov) = self.overlay_style(lineno, c0, &file_notes) {
+                    let idx = content_start + c0;
+                    if idx < cells.len() {
+                        cells[idx].1 = cells[idx].1.patch(ov);
+                    }
+                }
+            }
+
+            let mut spans: Vec<Span> = cells
+                .into_iter()
+                .map(|(c, st)| Span::styled(c.to_string(), st))
+                .collect();
+
+            // Cursor resting past the last character, or on an empty line.
+            if self.cursor_at(lineno, nchars) {
+                spans.push(Span::styled(
+                    " ",
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
+            } else if nchars == 0 {
+                if let Some(ov) = self.overlay_style(lineno, 0, &file_notes) {
+                    spans.push(Span::styled(" ", ov));
+                }
+            }
+
+            for n in &starts_here {
+                // Multi-line notes collapse to one row here (one preview line per
+                // file line keeps the cursor mapping exact); the full text shows
+                // in the editor overlay.
+                let text = n.text.replace('\n', " ⏎ ");
+                spans.push(Span::styled(format!("  ▸ {text}"), comment_style));
+            }
+            out.push(Line::from(spans));
+        }
+        if out.is_empty() {
+            out.push(Line::from(Span::styled(
+                "(empty file — nothing to annotate)",
+                gutter_style,
+            )));
+        }
+
+        self.annotate_gutter = gutter_cols;
+        self.preview = Text::from(out);
+        self.hunks = Vec::new();
+        self.ensure_cursor_visible();
+        self.clamp_scroll();
+    }
+
+    /// Map a screen cell to a (1-based file line, 0-based file column) in the
+    /// annotate view, or `None` if it falls outside the content.
+    fn annotate_cell_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        if !self.annotate {
+            return None;
+        }
+        let a = self.preview_area;
+        // Inside the bordered content region.
+        if col < a.x + 1 || col >= a.x + a.width.saturating_sub(1) {
+            return None;
+        }
+        if row < a.y + 1 || row >= a.y + a.height.saturating_sub(1) {
+            return None;
+        }
+        let rel_row = (row - (a.y + 1)) as usize;
+        let line = self.scroll as usize + rel_row + 1;
+        let total = self.annotate_lines.len();
+        if line == 0 || line > total {
+            return None;
+        }
+        let rel_col = (col - (a.x + 1)) as usize;
+        let fcol = rel_col.saturating_sub(self.annotate_gutter);
+        let len = self.annotate_lines[line - 1].chars().count();
+        Some((line, fcol.min(len)))
+    }
+
+    /// Overlay to layer onto a content cell — cursor over selection over note —
+    /// or `None` to leave the cell (its syntax color) untouched.
+    fn overlay_style(&self, line: usize, col: usize, file_notes: &[Note]) -> Option<Style> {
+        if self.cursor_at(line, col) {
+            return Some(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        if self.in_selection(line, col) {
+            return Some(Style::default().bg(Color::Blue));
+        }
+        if file_notes.iter().any(|n| n.contains(line, col)) {
+            return Some(
+                Style::default()
+                    .bg(Color::Rgb(58, 58, 74))
+                    .add_modifier(Modifier::UNDERLINED),
+            );
+        }
+        None
+    }
+
+    fn cursor_at(&self, line: usize, col: usize) -> bool {
+        self.cursor
+            .as_ref()
+            .is_some_and(|c| c.line == line && c.col == col)
+    }
+
+    /// Whether `(line, col)` is inside the live `v`/`V` selection.
+    fn in_selection(&self, line: usize, col: usize) -> bool {
+        let Some(cur) = &self.cursor else {
+            return false;
+        };
+        let Some(anchor) = cur.anchor else {
+            return false;
+        };
+        let end = (cur.line, cur.col);
+        let (a, b) = if end < anchor {
+            (end, anchor)
+        } else {
+            (anchor, end)
+        };
+        match cur.kind {
+            SelKind::Line => line >= a.0 && line <= b.0,
+            SelKind::Char => {
+                let after = line > a.0 || (line == a.0 && col >= a.1);
+                let before = line < b.0 || (line == b.0 && col <= b.1);
+                after && before
+            }
+        }
+    }
+
+    /// Scroll so the cursor's line is visible in the annotate view.
+    fn ensure_cursor_visible(&mut self) {
+        let Some(cur) = &self.cursor else { return };
+        let row = (cur.line - 1) as u16;
+        let height = self.preview_height.max(1);
+        if row < self.scroll {
+            self.scroll = row;
+        } else if row >= self.scroll + height {
+            self.scroll = row - height + 1;
+        }
     }
 
     fn clamp_scroll(&mut self) {
@@ -343,6 +769,18 @@ impl App {
         self.pending_quit = None;
         self.message.clear();
 
+        // While typing a note, keystrokes go to the input box.
+        if self.input.is_some() {
+            self.handle_input_key(key);
+            return Ok(());
+        }
+
+        // While typing an in-annotate search, keystrokes go to the find prompt.
+        if self.find.is_some() {
+            self.handle_find_key(key);
+            return Ok(());
+        }
+
         // Help overlay: '?' toggles it; while it's up, any key dismisses it.
         if matches!(key.code, KeyCode::Char('?')) {
             self.show_help = !self.show_help;
@@ -351,6 +789,30 @@ impl App {
         if self.show_help {
             self.show_help = false;
             return Ok(());
+        }
+
+        // Annotate view: enter it (and optionally start a selection) or, once in
+        // it, drive the cursor. Only meaningful for a file previewed on the right.
+        if self.focus == Focus::Right && matches!(self.view, View::File { .. }) {
+            if !self.annotate {
+                match key.code {
+                    KeyCode::Char('n') => {
+                        self.enter_annotate(None);
+                        return Ok(());
+                    }
+                    KeyCode::Char('v') => {
+                        self.enter_annotate(Some(SelKind::Char));
+                        return Ok(());
+                    }
+                    KeyCode::Char('V') => {
+                        self.enter_annotate(Some(SelKind::Line));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            } else if self.handle_cursor_key(key) {
+                return Ok(());
+            }
         }
 
         let on_left = self.focus == Focus::Left && self.show_left;
@@ -362,9 +824,11 @@ impl App {
             // Toggle the left panel
             KeyCode::Char('S') => {
                 self.show_left = !self.show_left;
-                if !self.show_left {
-                    self.focus = Focus::Right;
-                }
+                self.focus = if self.show_left {
+                    Focus::Left
+                } else {
+                    Focus::Right
+                };
             }
 
             // Toggle preview line wrapping
@@ -438,8 +902,8 @@ impl App {
             KeyCode::Char('z') => self.open_lazygit(terminal)?,
             KeyCode::Char('y') => self.open_yazi(terminal)?,
             KeyCode::Char('f') => self.pick_file(terminal)?,
-            KeyCode::Char('/') => self.search(terminal, SearchScope::Project)?,
-            KeyCode::Char('s') => self.search(terminal, SearchScope::File)?,
+            KeyCode::Char('s') => self.search(terminal, SearchScope::Project)?,
+            KeyCode::Char('/') => self.search(terminal, SearchScope::File)?,
             KeyCode::Char('e') => self.open_editor(terminal)?,
 
             _ => {}
@@ -448,7 +912,7 @@ impl App {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
-        if self.show_help {
+        if self.show_help || self.input.is_some() || self.find.is_some() {
             return;
         }
         let over_preview = contains(self.preview_area, m.column, m.row);
@@ -469,6 +933,7 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_down_preview = false;
                 if over_list {
                     self.focus = Focus::Left;
                     if let Some(idx) = self.list_row_at(m.row) {
@@ -477,7 +942,48 @@ impl App {
                     }
                 } else if over_preview {
                     self.focus = Focus::Right;
+                    self.mouse_down_preview = matches!(self.view, View::File { .. });
+                    self.mouse_anchor = None;
+                    // In the annotate view, position the cursor at the click and
+                    // clear any selection; a drag from here starts a new one.
+                    if let Some(cell) = self.annotate_cell_at(m.column, m.row) {
+                        if let Some(cur) = &mut self.cursor {
+                            cur.line = cell.0;
+                            cur.col = cell.1;
+                            cur.anchor = None;
+                        }
+                        self.mouse_anchor = Some(cell);
+                        self.needs_render = true;
+                    }
                 }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.mouse_down_preview {
+                    return;
+                }
+                // A drag over a file preview selects text — entering the annotate
+                // view first if the diff/content view is showing.
+                if !self.annotate {
+                    self.enter_annotate(None);
+                    return;
+                }
+                if let Some(cell) = self.annotate_cell_at(m.column, m.row) {
+                    if let Some(cur) = &mut self.cursor {
+                        if cur.anchor.is_none() {
+                            cur.anchor = Some(self.mouse_anchor.unwrap_or(cell));
+                            cur.kind = SelKind::Char;
+                        }
+                        cur.line = cell.0;
+                        cur.col = cell.1;
+                    }
+                    self.copy_selection();
+                    self.ensure_cursor_visible();
+                    self.needs_render = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.mouse_down_preview = false;
+                self.mouse_anchor = None;
             }
             _ => {}
         }
@@ -499,6 +1005,447 @@ impl App {
             "auto-refresh: {}",
             if self.auto_refresh { "on" } else { "off" }
         );
+    }
+
+    // ---- Annotate view: cursor, selection, notes ------------------------
+
+    /// Switch the right pane to the annotate view, placing the cursor at the top
+    /// and optionally starting a `v`/`V` selection there.
+    fn enter_annotate(&mut self, sel: Option<SelKind>) {
+        self.annotate = true;
+        self.scroll = 0;
+        let (anchor, kind) = match sel {
+            Some(k) => (Some((1, 0)), k),
+            None => (None, SelKind::Char),
+        };
+        self.cursor = Some(CursorState {
+            line: 1,
+            col: 0,
+            anchor,
+            kind,
+        });
+        self.message = "annotate · v/V select · c comment · d delete · n/Esc exit".into();
+        self.needs_render = true;
+    }
+
+    /// Leave the annotate view, back to the diff/content preview.
+    fn exit_annotate(&mut self) {
+        self.annotate = false;
+        self.cursor = None;
+        self.scroll = 0;
+        self.needs_render = true;
+    }
+
+    /// Handle a keypress while the annotate cursor is active. Returns whether the
+    /// key was consumed (unconsumed keys fall through to the global bindings).
+    fn handle_cursor_key(&mut self, key: KeyEvent) -> bool {
+        let total = self.annotate_lines.len().max(1);
+        let mut consumed = true;
+        let mut exit = false;
+        let mut start_note = false;
+        let mut delete = false;
+        let mut yank = false;
+        let mut start_find = false;
+        {
+            let Some(cur) = self.cursor.as_mut() else {
+                return false;
+            };
+            let line_len = |line: usize| -> usize {
+                self.annotate_lines
+                    .get(line - 1)
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0)
+            };
+            match key.code {
+                KeyCode::Char('h') | KeyCode::Left => cur.col = cur.col.saturating_sub(1),
+                KeyCode::Char('l') | KeyCode::Right => cur.col = cur.col.saturating_add(1),
+                KeyCode::Char('j') | KeyCode::Down => cur.line = (cur.line + 1).min(total),
+                KeyCode::Char('k') | KeyCode::Up => cur.line = cur.line.saturating_sub(1).max(1),
+                KeyCode::Char('0') => cur.col = 0,
+                KeyCode::Char('$') => cur.col = line_len(cur.line),
+                KeyCode::Char('^') => cur.col = first_nonblank(&self.annotate_lines, cur.line),
+                KeyCode::Char('w') => {
+                    (cur.line, cur.col) = word_forward(&self.annotate_lines, cur.line, cur.col);
+                }
+                KeyCode::Char('b') => {
+                    (cur.line, cur.col) = word_backward(&self.annotate_lines, cur.line, cur.col);
+                }
+                KeyCode::Char('e') => {
+                    (cur.line, cur.col) = word_end(&self.annotate_lines, cur.line, cur.col);
+                }
+                KeyCode::Char('g') => {
+                    cur.line = 1;
+                    cur.col = 0;
+                }
+                KeyCode::Char('G') => {
+                    cur.line = total;
+                    cur.col = 0;
+                }
+                // Paragraph motions (to the surrounding blank lines).
+                KeyCode::Char('{') => {
+                    cur.line = para_back(&self.annotate_lines, cur.line);
+                    cur.col = 0;
+                }
+                KeyCode::Char('}') => {
+                    cur.line = para_fwd(&self.annotate_lines, cur.line);
+                    cur.col = 0;
+                }
+                // Section motions (to unindented, top-level lines).
+                KeyCode::Char('[') => {
+                    cur.line = section_back(&self.annotate_lines, cur.line);
+                    cur.col = 0;
+                }
+                KeyCode::Char(']') => {
+                    cur.line = section_fwd(&self.annotate_lines, cur.line);
+                    cur.col = 0;
+                }
+                KeyCode::Char('v') => {
+                    cur.anchor = match cur.anchor {
+                        Some(_) if cur.kind == SelKind::Char => None,
+                        _ => Some((cur.line, cur.col)),
+                    };
+                    cur.kind = SelKind::Char;
+                }
+                KeyCode::Char('V') => {
+                    cur.anchor = match cur.anchor {
+                        Some(_) if cur.kind == SelKind::Line => None,
+                        _ => Some((cur.line, cur.col)),
+                    };
+                    cur.kind = SelKind::Line;
+                }
+                KeyCode::Char('c') => start_note = true,
+                KeyCode::Char('d') => delete = true,
+                KeyCode::Char('y') => yank = true,
+                KeyCode::Char('/') => start_find = true,
+                KeyCode::Char('n') => exit = true,
+                KeyCode::Esc => {
+                    if cur.anchor.is_some() {
+                        cur.anchor = None;
+                    } else {
+                        exit = true;
+                    }
+                }
+                _ => consumed = false,
+            }
+            // Keep the column within the (possibly new) line.
+            if consumed {
+                cur.col = cur.col.min(line_len(cur.line));
+            }
+        }
+
+        if exit {
+            self.exit_annotate();
+            return true;
+        }
+        if yank {
+            match self.copy_selection() {
+                Some(t) => {
+                    self.message = format!("yanked {} char(s)", t.chars().count());
+                    if let Some(c) = &mut self.cursor {
+                        c.anchor = None;
+                    }
+                }
+                None => self.message = "nothing selected".into(),
+            }
+            self.needs_render = true;
+            return true;
+        }
+        if delete {
+            self.delete_note_at_cursor();
+        }
+        if start_note {
+            self.begin_note();
+        }
+        if start_find {
+            self.find = Some(String::new());
+            self.message.clear();
+        }
+        if consumed {
+            // A live selection mirrors to the clipboard as it grows.
+            if !start_note && !delete && self.cursor.as_ref().is_some_and(|c| c.anchor.is_some()) {
+                self.copy_selection();
+            }
+            self.ensure_cursor_visible();
+            self.needs_render = true;
+        }
+        consumed
+    }
+
+    /// Copy the live selection to the system clipboard, returning its text.
+    fn copy_selection(&self) -> Option<String> {
+        let cur = self.cursor.as_ref()?;
+        let anchor = cur.anchor?;
+        let text =
+            notes::selection_text(cur.kind, anchor, (cur.line, cur.col), &self.annotate_lines)?;
+        let _ = external::copy_to_clipboard(&text);
+        Some(text)
+    }
+
+    /// Handle a keypress while the in-annotate search prompt (`/`) is open.
+    fn handle_find_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.find = None;
+                self.message = "search cancelled".into();
+            }
+            KeyCode::Enter => {
+                let typed = self.find.take().unwrap_or_default();
+                // An empty query repeats the last search.
+                let query = if typed.is_empty() {
+                    self.last_find.clone().unwrap_or_default()
+                } else {
+                    typed
+                };
+                if query.is_empty() {
+                    self.message = "no search pattern".into();
+                } else {
+                    self.last_find = Some(query.clone());
+                    self.find_jump(&query);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(q) = &mut self.find {
+                    q.pop();
+                }
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(q) = &mut self.find {
+                    q.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Move the annotate cursor to the next case-insensitive match of `query`
+    /// after the current position, wrapping around the file.
+    fn find_jump(&mut self, query: &str) {
+        let Some(cur) = self.cursor.as_ref() else {
+            return;
+        };
+        let (cl, cc) = (cur.line, cur.col);
+        let needle = query.to_lowercase();
+
+        let mut first: Option<(usize, usize)> = None;
+        let mut after: Option<(usize, usize)> = None;
+        for (i, line) in self.annotate_lines.iter().enumerate() {
+            let lineno = i + 1;
+            let hay = line.to_lowercase();
+            let mut byte = 0;
+            while let Some(rel) = hay[byte..].find(&needle) {
+                let abs = byte + rel;
+                let col = hay[..abs].chars().count();
+                if first.is_none() {
+                    first = Some((lineno, col));
+                }
+                if after.is_none() && (lineno > cl || (lineno == cl && col > cc)) {
+                    after = Some((lineno, col));
+                }
+                byte = abs + needle.len();
+                if byte >= hay.len() {
+                    break;
+                }
+            }
+        }
+
+        match after.or(first) {
+            Some((l, c)) => {
+                if let Some(cur) = &mut self.cursor {
+                    cur.line = l;
+                    cur.col = c;
+                }
+                self.ensure_cursor_visible();
+                self.needs_render = true;
+                self.message = if after.is_some() {
+                    format!("/{query}")
+                } else {
+                    format!("/{query} (wrapped)")
+                };
+            }
+            None => self.message = format!("not found: {query}"),
+        }
+    }
+
+    /// Open the note-text input. With nothing selected and the cursor resting on
+    /// an existing note, this edits that note; otherwise it composes a new note
+    /// over the selection (or the current line).
+    fn begin_note(&mut self) {
+        let Some(cur) = self.cursor.clone() else {
+            return;
+        };
+        let rel = match &self.view {
+            View::File { path, .. } => path.to_string_lossy().to_string(),
+            View::Home => return,
+        };
+
+        // Editing: no live selection, cursor over an existing note.
+        if cur.anchor.is_none() {
+            if let Some(note) = self
+                .notes
+                .get(&rel)
+                .and_then(|ns| ns.iter().find(|n| n.contains(cur.line, cur.col)))
+            {
+                self.input = Some(InputState {
+                    cursor: note.text.chars().count(),
+                    buffer: note.text.clone(),
+                    kind: note.kind,
+                    start: (note.start_line, note.start_col),
+                    end: (note.end_line, note.end_col),
+                    editing: Some(note.id),
+                });
+                self.message.clear();
+                return;
+            }
+        }
+
+        // New note: over the selection, or the current line when nothing is selected.
+        let (kind, start, end) = match cur.anchor {
+            Some(a) => (cur.kind, a, (cur.line, cur.col)),
+            None => (SelKind::Line, (cur.line, 0), (cur.line, 0)),
+        };
+        // The cursor may rest just past a line's last character; pin note columns
+        // to real characters so the selection resolves.
+        let clamp = |(l, c): (usize, usize)| -> (usize, usize) {
+            let len = self
+                .annotate_lines
+                .get(l - 1)
+                .map(|s| s.chars().count())
+                .unwrap_or(0);
+            (l, if len == 0 { 0 } else { c.min(len - 1) })
+        };
+        let (start, end) = if kind == SelKind::Char {
+            (clamp(start), clamp(end))
+        } else {
+            (start, end)
+        };
+        self.input = Some(InputState {
+            buffer: String::new(),
+            cursor: 0,
+            kind,
+            start,
+            end,
+            editing: None,
+        });
+        self.message.clear();
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+S saves, Esc cancels — these touch `self`, so handle before
+        // borrowing the input box.
+        match key.code {
+            KeyCode::Esc => {
+                self.input = None;
+                self.message = "note cancelled".into();
+                return;
+            }
+            KeyCode::Char('s') if ctrl => {
+                self.commit_note();
+                return;
+            }
+            _ => {}
+        }
+        let Some(i) = &mut self.input else {
+            return;
+        };
+        match key.code {
+            // Enter inserts a newline (notes are multi-line; Ctrl+S saves).
+            KeyCode::Enter => i.insert('\n'),
+            KeyCode::Backspace => i.backspace(),
+            KeyCode::Delete => i.delete(),
+            KeyCode::Left => i.left(),
+            KeyCode::Right => i.right(),
+            KeyCode::Up => i.up(),
+            KeyCode::Down => i.down(),
+            KeyCode::Home => i.home(),
+            KeyCode::End => i.end(),
+            KeyCode::Char(c) if !ctrl => i.insert(c),
+            _ => {}
+        }
+    }
+
+    /// Save the note being composed or edited, anchoring new notes to their text.
+    fn commit_note(&mut self) {
+        let Some(input) = self.input.take() else {
+            return;
+        };
+        let text = input.buffer.trim().to_string();
+        if text.is_empty() {
+            self.message = "note discarded (empty)".into();
+            return;
+        }
+        let rel = match &self.view {
+            View::File { path, .. } => path.to_string_lossy().to_string(),
+            View::Home => return,
+        };
+
+        if let Some(id) = input.editing {
+            // Update an existing note's text in place, keeping its anchor.
+            if let Some(ns) = self.notes.get_mut(&rel) {
+                if let Some(n) = ns.iter_mut().find(|n| n.id == id) {
+                    n.text = text;
+                }
+                if let Err(e) = notes::save(&self.root, &rel, ns) {
+                    self.message = format!("note save failed: {e}");
+                } else {
+                    self.message = "note updated".into();
+                }
+            }
+        } else {
+            let Some(note) = Note::new(
+                input.kind,
+                input.start,
+                input.end,
+                text,
+                &self.annotate_lines,
+            ) else {
+                self.message = "could not anchor note".into();
+                return;
+            };
+            let entry = self.notes.entry(rel.clone()).or_default();
+            entry.push(note);
+            if let Err(e) = notes::save(&self.root, &rel, entry) {
+                self.message = format!("note save failed: {e}");
+            } else {
+                self.message = "note saved".into();
+            }
+        }
+
+        if let Some(cur) = &mut self.cursor {
+            cur.anchor = None;
+        }
+        self.needs_render = true;
+    }
+
+    /// Delete the first note covering the cursor position, if any.
+    fn delete_note_at_cursor(&mut self) {
+        let Some(cur) = self.cursor.clone() else {
+            return;
+        };
+        let rel = match &self.view {
+            View::File { path, .. } => path.to_string_lossy().to_string(),
+            View::Home => return,
+        };
+        let mut deleted = false;
+        let mut empty = false;
+        if let Some(ns) = self.notes.get_mut(&rel) {
+            if let Some(pos) = ns.iter().position(|n| n.contains(cur.line, cur.col)) {
+                ns.remove(pos);
+                deleted = true;
+                let _ = notes::save(&self.root, &rel, ns);
+                empty = ns.is_empty();
+            }
+        }
+        if empty {
+            self.notes.remove(&rel);
+        }
+        if deleted {
+            self.message = "note deleted".into();
+            self.needs_render = true;
+        } else {
+            self.message = "no note under cursor".into();
+        }
     }
 
     /// Scroll to the previous (`dir < 0`) or next (`dir > 0`) hunk.
@@ -606,6 +1553,7 @@ impl App {
         }
         self.view = View::File { path, line };
         self.scroll = 0;
+        self.reset_annotate_for_view();
         self.needs_render = true;
     }
 
@@ -692,8 +1640,11 @@ impl App {
     // ---- Drawing --------------------------------------------------------
 
     fn draw(&mut self, f: &mut Frame) {
-        let (list_area, preview_area, footer_area) =
-            layout(f.area(), self.show_left, self.desired_left_width(f.area().width));
+        let (list_area, preview_area, footer_area) = layout(
+            f.area(),
+            self.show_left,
+            self.desired_left_width(f.area().width),
+        );
         if self.show_left {
             self.draw_list(f, list_area);
         }
@@ -702,6 +1653,70 @@ impl App {
         if self.show_help {
             self.draw_help(f);
         }
+        if self.input.is_some() {
+            self.draw_note_input(f);
+        }
+    }
+
+    /// Centered overlay for composing/editing a multi-line note.
+    fn draw_note_input(&self, f: &mut Frame) {
+        let Some(input) = &self.input else {
+            return;
+        };
+        let (a, b) = (input.start.0, input.end.0);
+        let where_ = if a == b {
+            format!("line {a}")
+        } else {
+            format!("lines {a}-{b}")
+        };
+        let verb = if input.editing.is_some() {
+            "Edit note"
+        } else {
+            "New note"
+        };
+
+        // The buffer, split on newlines, with a block cursor at its position.
+        let (crow, ccol) = input.line_col();
+        let cursor = Style::default().add_modifier(Modifier::REVERSED);
+        let mut lines: Vec<Line> = Vec::new();
+        for (i, part) in input.buffer.split('\n').enumerate() {
+            if i == crow {
+                let chars: Vec<char> = part.chars().collect();
+                let before: String = chars[..ccol.min(chars.len())].iter().collect();
+                let (at, after) = if ccol < chars.len() {
+                    (chars[ccol].to_string(), chars[ccol + 1..].iter().collect())
+                } else {
+                    (" ".to_string(), String::new())
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(before),
+                    Span::styled(at, cursor),
+                    Span::raw(after),
+                ]));
+            } else {
+                lines.push(Line::from(part.to_string()));
+            }
+        }
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "⏎ newline · Ctrl+S save · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let width = 72u16.min(f.area().width.saturating_sub(4));
+        let height = (lines.len() as u16 + 2).clamp(5, f.area().height.saturating_sub(2));
+        let area = centered_rect(width, height, f.area());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(" {verb} · {where_} "));
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 
     /// Left-panel width just wide enough for the longest row (clamped so the
@@ -711,7 +1726,13 @@ impl App {
         let mut content = ROOT_LABEL.chars().count();
         content = content.max(format!(" Changes ({}) ", self.files.len()).chars().count());
         for file in &self.files {
-            content = content.max(2 + file.path.chars().count());
+            let badge = self
+                .notes
+                .get(&file.path)
+                .filter(|n| !n.is_empty())
+                .map(|n| 3 + n.len().to_string().len())
+                .unwrap_or(0);
+            content = content.max(2 + file.path.chars().count() + badge);
         }
         // + highlight symbol ("▶ ") + borders + a column of padding.
         let want = content as u16 + 2 + 2 + 1;
@@ -747,10 +1768,19 @@ impl App {
                 'R' => Color::Magenta,
                 _ => Color::Gray,
             };
-            items.push(ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{marker} "), Style::default().fg(color)),
                 Span::raw(file.path.clone()),
-            ])));
+            ];
+            if let Some(n) = self.notes.get(&file.path) {
+                if !n.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  ✎{}", n.len()),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+            }
+            items.push(ListItem::new(Line::from(spans)));
         }
 
         let title = format!(" Changes ({}) ", self.files.len());
@@ -781,19 +1811,26 @@ impl App {
             View::File { path, .. } => format!(" {} ", path.display()),
         };
         let total = self.preview.lines.len();
-        let mode = self.diff_mode.label();
-        let mut flags = format!("diff: {mode}");
-        if self.wrap {
-            flags.push_str(" · wrap");
-        }
-        if self.auto_refresh {
-            flags.push_str(" · auto");
-        }
+        let bottom = if self.annotate {
+            match &self.cursor {
+                Some(c) => format!(" {total}L · annotate · {}:{} ", c.line, c.col),
+                None => format!(" {total}L · annotate "),
+            }
+        } else {
+            let mut flags = format!("diff: {}", self.diff_mode.label());
+            if self.wrap {
+                flags.push_str(" · wrap");
+            }
+            if self.auto_refresh {
+                flags.push_str(" · auto");
+            }
+            format!(" {total}L · {flags} ")
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.border_style(Focus::Right))
             .title(title)
-            .title_bottom(format!(" {total}L · {flags} "));
+            .title_bottom(bottom);
 
         // delta/bat already wrap (or truncate) to the pane width, so the
         // paragraph just clips — no ratatui-level wrapping needed.
@@ -804,21 +1841,38 @@ impl App {
     }
 
     fn draw_footer(&mut self, f: &mut Frame, area: Rect) {
-        let help = "? help · h/l focus · j/k move · [ ] hunk · ⏎ open · e edit · z lazygit · / s search · ^C ^C / ^D quit";
-        let line = if self.message.is_empty() {
-            Line::from(Span::styled(help, Style::default().fg(Color::DarkGray)))
-        } else {
+        let dim = Style::default().fg(Color::DarkGray);
+        let help = "? help · h/l focus · j/k move · [ ] hunk · ⏎ open · v/n annotate · e edit · / s search · ^C ^C / ^D quit";
+        let annotate_help =
+            "annotate · hjkl/wbe/{}[] move · / find · v/V select · y copy · c comment · d delete · n/Esc exit";
+        let line = if let Some(q) = &self.find {
+            Line::from(vec![
+                Span::styled(
+                    "/",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(q.clone()),
+                Span::styled("▏", Style::default().fg(Color::Cyan)),
+                Span::styled("   (⏎ next · Esc cancel)", dim),
+            ])
+        } else if !self.message.is_empty() {
             Line::from(Span::styled(
                 self.message.clone(),
                 Style::default().fg(Color::Yellow),
             ))
+        } else if self.annotate {
+            Line::from(Span::styled(annotate_help, dim))
+        } else {
+            Line::from(Span::styled(help, dim))
         };
         f.render_widget(Paragraph::new(line), area);
     }
 
     /// Centered overlay listing every keybinding.
     fn draw_help(&self, f: &mut Frame) {
-        let entries: [(&str, &str); 23] = [
+        let entries = [
             ("h / l", "focus left / right panel"),
             ("j / k", "move selection (left) or scroll (right)"),
             ("g / G", "first/last item, or top/bottom of preview"),
@@ -829,19 +1883,41 @@ impl App {
             ("S", "toggle the left (files) panel"),
             ("W", "toggle preview line wrapping"),
             ("1 / 2 / 3", "diff layout: stacked / side-by-side / auto"),
-            ("e", "open current file/hunk in $EDITOR"),
-            ("z", "open lazygit"),
-            ("y", "pick a file with yazi"),
-            ("f", "pick a filename with fzf"),
-            ("/", "search the project diff"),
-            ("s", "search the current file's diff"),
-            ("r", "refresh now"),
-            ("R", "toggle auto-refresh"),
-            ("?", "toggle this help"),
-            ("Ctrl+D", "quit"),
-            ("Ctrl+C Ctrl+C", "quit"),
-            ("Esc / any key", "close this help"),
             ("", ""),
+            ("n", "annotate the current file (cursor mode)"),
+            (
+                "v / V",
+                "start char / line selection (also enters annotate)",
+            ),
+            (
+                "hjkl w b e 0 ^ $ g G",
+                "move the annotate cursor (vim motions)",
+            ),
+            ("{ } / [ ]", "prev/next paragraph / top-level section"),
+            (
+                "/ (in annotate)",
+                "find text in the file (⏎ next match, wraps)",
+            ),
+            ("mouse drag", "select text (and copy it)"),
+            ("y", "copy the selection to the clipboard"),
+            (
+                "c",
+                "comment on the selection, or edit the note under the cursor",
+            ),
+            (
+                "Ctrl+S / ⏎",
+                "save the note / add a newline (notes are multi-line)",
+            ),
+            ("d", "delete the note under the cursor"),
+            ("Esc / n", "clear selection / leave annotate mode"),
+            ("← → ↑ ↓ in a note", "move the text cursor while editing"),
+            ("", ""),
+            ("e", "open current file/hunk in $EDITOR"),
+            ("z / y / f", "lazygit / yazi / fzf"),
+            ("s / /", "search project / current-file diff"),
+            ("r / R", "refresh now / toggle auto-refresh"),
+            ("?", "toggle this help"),
+            ("Ctrl+D / Ctrl+C Ctrl+C", "quit"),
         ];
 
         let mut lines: Vec<Line> = Vec::new();
@@ -853,7 +1929,9 @@ impl App {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{key:>16}  "),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(*desc),
             ]));
@@ -900,6 +1978,235 @@ fn layout(area: Rect, show_left: bool, left_width: u16) -> (Rect, Rect, Rect) {
     (cols[0], cols[1], rows[1])
 }
 
+/// A note's anchor coordinates, for detecting whether re-anchoring moved it.
+fn coords(n: &Note) -> (usize, usize, usize, usize) {
+    (n.start_line, n.start_col, n.end_line, n.end_col)
+}
+
+/// Flatten a rendered line into per-character `(char, style)` cells.
+fn flatten_line(line: &Line) -> Vec<(char, Style)> {
+    let mut cells = Vec::new();
+    for span in &line.spans {
+        let style = line.style.patch(span.style);
+        for ch in span.content.chars() {
+            cells.push((ch, style));
+        }
+    }
+    cells
+}
+
+/// Column where content begins after `bat`'s `numbers` gutter — leading pad,
+/// the line-number digits, and a single separating space.
+fn gutter_end(cells: &[(char, Style)]) -> usize {
+    let n = cells.len();
+    let mut i = 0;
+    while i < n && cells[i].0 == ' ' {
+        i += 1;
+    }
+    while i < n && cells[i].0.is_ascii_digit() {
+        i += 1;
+    }
+    if i < n && cells[i].0 == ' ' {
+        i += 1;
+    }
+    i
+}
+
+// ---- Vim-style word motions for the annotate cursor -------------------------
+//
+// Positions are (1-based line, 0-based col). Characters split into three
+// classes — blank, word (alphanumeric/`_`), and punctuation — matching vim's
+// small-word (`w`/`b`/`e`) behavior closely enough for review navigation.
+
+/// Character count of `line` (1-based) in `lines`.
+fn nchars(lines: &[String], line: usize) -> usize {
+    line.checked_sub(1)
+        .and_then(|i| lines.get(i))
+        .map(|s| s.chars().count())
+        .unwrap_or(0)
+}
+
+fn char_at(lines: &[String], line: usize, col: usize) -> Option<char> {
+    lines.get(line.checked_sub(1)?)?.chars().nth(col)
+}
+
+/// 0 = blank/out-of-bounds, 1 = word char, 2 = punctuation.
+fn class_of(c: Option<char>) -> u8 {
+    match c {
+        Some(c) if c.is_whitespace() => 0,
+        Some(c) if c.is_alphanumeric() || c == '_' => 1,
+        Some(_) => 2,
+        None => 0,
+    }
+}
+
+/// The next position after `(line, col)`, rolling onto the next line's start.
+fn adv(lines: &[String], line: usize, col: usize) -> Option<(usize, usize)> {
+    if col + 1 < nchars(lines, line) {
+        Some((line, col + 1))
+    } else if line < lines.len() {
+        Some((line + 1, 0))
+    } else {
+        None
+    }
+}
+
+/// The previous position before `(line, col)`, rolling onto the prior line's end.
+fn retr(lines: &[String], line: usize, col: usize) -> Option<(usize, usize)> {
+    if col > 0 {
+        Some((line, col - 1))
+    } else if line > 1 {
+        Some((line - 1, nchars(lines, line - 1).saturating_sub(1)))
+    } else {
+        None
+    }
+}
+
+/// Whether `line` (1-based) is empty or all whitespace.
+fn is_blank(lines: &[String], line: usize) -> bool {
+    line.checked_sub(1)
+        .and_then(|i| lines.get(i))
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+}
+
+/// Whether `line` (1-based) starts a top-level construct (a non-blank line whose
+/// first character is not whitespace).
+fn is_section(lines: &[String], line: usize) -> bool {
+    line.checked_sub(1)
+        .and_then(|i| lines.get(i))
+        .is_some_and(|s| s.chars().next().is_some_and(|c| !c.is_whitespace()))
+}
+
+/// `{` — the blank line above the current paragraph (or the first line).
+fn para_back(lines: &[String], line: usize) -> usize {
+    let mut l = line.saturating_sub(1);
+    while l > 1 && is_blank(lines, l) {
+        l -= 1;
+    }
+    while l > 1 && !is_blank(lines, l) {
+        l -= 1;
+    }
+    l.max(1)
+}
+
+/// `}` — the blank line below the current paragraph (or the last line).
+fn para_fwd(lines: &[String], line: usize) -> usize {
+    let n = lines.len();
+    if n == 0 {
+        return 1;
+    }
+    let mut l = (line + 1).min(n);
+    while l < n && is_blank(lines, l) {
+        l += 1;
+    }
+    while l < n && !is_blank(lines, l) {
+        l += 1;
+    }
+    l
+}
+
+/// `[` — the previous top-level (unindented) line, or the first line.
+fn section_back(lines: &[String], line: usize) -> usize {
+    let mut l = line.saturating_sub(1);
+    while l > 1 {
+        if is_section(lines, l) {
+            return l;
+        }
+        l -= 1;
+    }
+    1
+}
+
+/// `]` — the next top-level (unindented) line, or the last line.
+fn section_fwd(lines: &[String], line: usize) -> usize {
+    let n = lines.len().max(1);
+    let mut l = line + 1;
+    while l < n {
+        if is_section(lines, l) {
+            return l;
+        }
+        l += 1;
+    }
+    n
+}
+
+/// Column of the first non-blank character on `line`, or 0.
+fn first_nonblank(lines: &[String], line: usize) -> usize {
+    line.checked_sub(1)
+        .and_then(|i| lines.get(i))
+        .and_then(|s| s.chars().position(|c| !c.is_whitespace()))
+        .unwrap_or(0)
+}
+
+/// `w` — start of the next word.
+fn word_forward(lines: &[String], line: usize, col: usize) -> (usize, usize) {
+    let start = class_of(char_at(lines, line, col));
+    let Some(mut p) = adv(lines, line, col) else {
+        return (line, col);
+    };
+    // Skip the rest of the current word, then any blanks.
+    if start != 0 {
+        while class_of(char_at(lines, p.0, p.1)) == start {
+            match adv(lines, p.0, p.1) {
+                Some(x) => p = x,
+                None => return p,
+            }
+        }
+    }
+    while class_of(char_at(lines, p.0, p.1)) == 0 {
+        match adv(lines, p.0, p.1) {
+            Some(x) => p = x,
+            None => break,
+        }
+    }
+    p
+}
+
+/// `b` — start of the current or previous word.
+fn word_backward(lines: &[String], line: usize, col: usize) -> (usize, usize) {
+    let Some(mut p) = retr(lines, line, col) else {
+        return (line, col);
+    };
+    while class_of(char_at(lines, p.0, p.1)) == 0 {
+        match retr(lines, p.0, p.1) {
+            Some(x) => p = x,
+            None => return p,
+        }
+    }
+    let cls = class_of(char_at(lines, p.0, p.1));
+    while let Some(prev) = retr(lines, p.0, p.1) {
+        if class_of(char_at(lines, prev.0, prev.1)) == cls {
+            p = prev;
+        } else {
+            break;
+        }
+    }
+    p
+}
+
+/// `e` — end of the current or next word.
+fn word_end(lines: &[String], line: usize, col: usize) -> (usize, usize) {
+    let Some(mut p) = adv(lines, line, col) else {
+        return (line, col);
+    };
+    while class_of(char_at(lines, p.0, p.1)) == 0 {
+        match adv(lines, p.0, p.1) {
+            Some(x) => p = x,
+            None => return p,
+        }
+    }
+    let cls = class_of(char_at(lines, p.0, p.1));
+    while let Some(nx) = adv(lines, p.0, p.1) {
+        if class_of(char_at(lines, nx.0, nx.1)) == cls {
+            p = nx;
+        } else {
+            break;
+        }
+    }
+    p
+}
+
 /// Whether `(col, row)` falls inside `area`.
 fn contains(area: Rect, col: u16, row: u16) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
@@ -921,7 +2228,12 @@ fn analyze_hunks(text: &Text) -> Vec<Hunk> {
     let lines: Vec<String> = text
         .lines
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
         .collect();
 
     let mut hunks = Vec::new();

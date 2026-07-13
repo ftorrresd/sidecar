@@ -3,8 +3,8 @@
 //! `delta` formats diffs and `bat` formats plain files; both emit ANSI escape
 //! sequences which `ansi-to-tui` converts into ratatui `Text` for display.
 
-use anyhow::{Context, Result};
 use ansi_to_tui::IntoText;
+use anyhow::{Context, Result};
 use ratatui::text::Text;
 use std::io::Write;
 use std::path::Path;
@@ -97,4 +97,44 @@ pub fn content_text(path: &Path, width: u16, wrap: bool) -> Text<'static> {
         Ok(bytes) => ansi_to_text(bytes),
         Err(e) => Text::raw(format!("bat error: {e}")),
     }
+}
+
+/// Syntax-highlight `content` for the annotate view: one rendered line per input
+/// line, with a line-number gutter and no wrapping (so screen rows map 1:1 to
+/// file lines). `name` hints the language for highlighting.
+pub fn highlight(content: &str, name: &str, width: u16) -> Text<'static> {
+    match bat_stdin(content, name, width) {
+        Ok(bytes) => ansi_to_text(bytes),
+        Err(_) => Text::raw(content.to_owned()),
+    }
+}
+
+/// Run `content` through `bat` from stdin, using `name` only to pick the syntax.
+fn bat_stdin(content: &str, name: &str, width: u16) -> Result<Vec<u8>> {
+    let mut child = Command::new("bat")
+        .args([
+            "--color=always",
+            "--style=numbers",
+            "--paging=never",
+            "--wrap",
+            "never",
+            "--terminal-width",
+            &width.to_string(),
+            "--file-name",
+            name,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to spawn bat")?;
+
+    let mut stdin = child.stdin.take().context("bat stdin unavailable")?;
+    let owned = content.to_owned();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(owned.as_bytes());
+    });
+    let output = child.wait_with_output().context("bat failed")?;
+    let _ = writer.join();
+    Ok(output.stdout)
 }

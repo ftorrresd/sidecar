@@ -108,6 +108,40 @@ pub fn edit(file: &Path, line: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+/// Copy `text` to the system clipboard, trying the common Wayland/X11/macOS
+/// tools in turn. Runs headless (no terminal takeover).
+pub fn copy_to_clipboard(text: &str) -> Result<()> {
+    const TOOLS: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("pbcopy", &[]),
+    ];
+    for (prog, args) in TOOLS {
+        if try_copy(prog, args, text) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("no clipboard tool found (install wl-clipboard, xclip, or xsel)")
+}
+
+/// Feed `text` to `prog` on stdin; returns whether it ran and exited cleanly.
+fn try_copy(prog: &str, args: &[&str], text: &str) -> bool {
+    let Ok(mut child) = Command::new(prog)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
 /// Shared fzf-in-reload-mode search used by `search_project`/`search_file`.
 fn reload_search(root: &Path, reload_cmd: &str) -> Result<Option<Hit>> {
     let out = Command::new("fzf")
@@ -156,7 +190,9 @@ fn first_path(text: &str) -> Option<PathBuf> {
 /// Make `path` relative to `root` when it lives inside the repo.
 fn relativize(root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
-        path.strip_prefix(root).map(Path::to_path_buf).unwrap_or_else(|_| path.to_path_buf())
+        path.strip_prefix(root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
     } else {
         path.to_path_buf()
     }

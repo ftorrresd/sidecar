@@ -1,8 +1,8 @@
+# Build output
 /target
 
+# Embedded test project (not a submodule)
+/test-project
 
-# Added by cargo
-#
-# already existing elements were commented out
-
-#/target
+# Sidecar review notes
+/.sidecar

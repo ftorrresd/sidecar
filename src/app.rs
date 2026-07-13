@@ -867,9 +867,9 @@ impl App {
             return Ok(());
         }
 
-        // Annotate view: enter it (and optionally start a selection) or, once in
-        // it, drive the cursor. Only meaningful for a file previewed on the right.
-        if self.focus == Focus::Right && matches!(self.view, View::File { .. }) {
+        // Annotation can be entered while a file is selected in either panel;
+        // cursor keys are only captured once the preview has focus.
+        if matches!(self.view, View::File { .. }) {
             if !self.annotate {
                 match key.code {
                     KeyCode::Char('n') => {
@@ -886,7 +886,15 @@ impl App {
                     }
                     _ => {}
                 }
-            } else if self.handle_cursor_key(key) {
+            } else if self.focus == Focus::Left
+                && matches!(key.code, KeyCode::Char('n' | 'v' | 'V'))
+            {
+                self.focus = Focus::Right;
+                if !matches!(key.code, KeyCode::Char('n')) {
+                    self.handle_cursor_key(key);
+                }
+                return Ok(());
+            } else if self.focus == Focus::Right && self.handle_cursor_key(key) {
                 return Ok(());
             }
         }
@@ -1122,6 +1130,7 @@ impl App {
     /// Switch the right pane to the annotate view, placing the cursor at the top
     /// and optionally starting a `v`/`V` selection there.
     fn enter_annotate(&mut self, sel: Option<SelKind>) {
+        self.focus = Focus::Right;
         self.annotate = true;
         self.scroll = 0;
         let (anchor, kind) = match sel {

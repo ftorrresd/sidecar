@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "runk-calc"
+version = "0.1.0"
+description = "A simple CLI calculator"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]

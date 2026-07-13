@@ -1,0 +1,16 @@
+[package]
+name = "sidecar"
+version = "0.1.0"
+edition = "2021"
+description = "A side-by-side diff/review TUI for agentic coding workflows"
+
+[[bin]]
+name = "sidecar"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+ansi-to-tui = "7"
+tempfile = "3"

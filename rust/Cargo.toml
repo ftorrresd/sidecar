@@ -1,9 +1,0 @@
-[package]
-name = "strutils"
-version = "0.1.0"
-edition = "2021"
-description = "String manipulation utilities"
-
-[dependencies]
-
-[dev-dependencies]

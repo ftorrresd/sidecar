@@ -1742,8 +1742,9 @@ impl App {
         };
 
         let root = self.root.clone();
-        let result =
-            tui::suspend(terminal, || external::search_content(&root, &targets, prompt, header))?;
+        let result = tui::suspend(terminal, || {
+            external::search_content(&root, &targets, prompt, header)
+        })?;
 
         match result {
             Ok(Some(hit)) => self.open_path(hit.path, hit.line),

@@ -3,10 +3,15 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ftorrresd/sidecar/main/scripts/install.sh | sh
 #
+# Every runtime dependency (except git) is installed into a sidecar-private
+# directory and used only by sidecar — nothing is skipped because a copy already
+# exists elsewhere, and nothing is added to your shell PATH.
+#
 # Environment overrides:
 #   SIDECAR_VERSION       tag to install (default: latest release)
-#   SIDECAR_BIN_DIR       install directory (default: $HOME/.local/bin)
-#   SIDECAR_INSTALL_DEPS  1 = auto-install missing deps, 0 = never (default: ask)
+#   SIDECAR_BIN_DIR       where the sidecar binary goes (default: $HOME/.local/bin)
+#   SIDECAR_TOOLS_DIR     private dir for bundled deps
+#                         (default: ${XDG_DATA_HOME:-$HOME/.local/share}/sidecar/bin)
 #   GITHUB_TOKEN          optional token for GitHub API rate limits
 
 set -eu
@@ -104,22 +109,13 @@ gh_latest_tag() {
 	printf '%s\n' "$tag"
 }
 
-# Prompt for yes/no (reading the real terminal, since stdin may be the pipe).
-# SIDECAR_INSTALL_DEPS forces the answer for non-interactive installs.
-confirm() {
-	case "${SIDECAR_INSTALL_DEPS:-}" in
-	1 | y | Y | yes) return 0 ;;
-	0 | n | N | no) return 1 ;;
-	esac
-	[ -r /dev/tty ] || return 1
-	printf '%s [y/N] ' "$1" >/dev/tty
-	IFS= read -r ans </dev/tty || ans=""
-	case "$ans" in y | Y | yes | YES) return 0 ;; *) return 1 ;; esac
-}
-
-# ---- Install location -------------------------------------------------------
+# ---- Install locations ------------------------------------------------------
+# The sidecar binary goes on your PATH; its dependencies go into a private dir
+# that only sidecar looks in (it prepends this dir to PATH at startup), so the
+# bundled copies never collide with or depend on anything else you have installed.
 bindir="${SIDECAR_BIN_DIR:-$HOME/.local/bin}"
-mkdir -p "$bindir"
+toolsdir="${SIDECAR_TOOLS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/sidecar/bin}"
+mkdir -p "$bindir" "$toolsdir"
 
 # ---- Install sidecar itself -------------------------------------------------
 # Skipped when SIDECAR_DEPS_ONLY=1 (used by CI to test just the dependency
@@ -189,9 +185,9 @@ install_archive() {
 		return 1
 	fi
 	chmod +x "$src"
-	mv -f "$src" "$bindir/$name"
+	mv -f "$src" "$toolsdir/$name"
 	rm -rf "$dir"
-	info "  installed ${name} to ${bindir}/${name}"
+	info "  installed ${name} to ${toolsdir}/${name}"
 }
 
 # Per-tool installers (each release names its assets differently).
@@ -220,31 +216,34 @@ install_lazygit() {
 	install_archive "https://github.com/jesseduffield/lazygit/releases/download/${t}/lazygit_${t#v}_${lazygit_os}_${lazygit_arch}.tar.gz" lazygit tar
 }
 
-# Offer to install a missing tool. Args: command-name  label  installer-fn  note.
-# SIDECAR_FORCE_DEPS=1 installs even when the tool is already present (CI test).
-offer_install() {
-	cmd=$1
-	label=$2
-	fn=$3
+# Install a bundled tool. Args: label  installer-fn  role  note.
+# Always installs a fresh copy into $toolsdir — it does not check PATH, so the
+# bundle is self-contained and independent of any pre-existing installation.
+# `role` is "required" (abort on failure) or "optional" (warn and continue).
+install_tool() {
+	label=$1
+	fn=$2
+	role=$3
 	note=$4
-	if [ "${SIDECAR_FORCE_DEPS:-0}" != 1 ]; then
-		command -v "$cmd" >/dev/null 2>&1 && return 0
+	info "installing ${label}..."
+	if "$fn"; then
+		return 0
 	fi
-	if confirm "${label} is not installed. Install the latest from GitHub?"; then
-		"$fn" || err "failed to install ${label}: ${note}"
+	if [ "$role" = required ]; then
+		err "failed to install ${label}: ${note}"
 	else
-		warn "${label} — ${note}"
+		warn "${label} not installed — ${note}"
 	fi
 }
 
 # Required renderers.
-offer_install delta delta install_delta "needed at runtime: https://github.com/dandavison/delta/releases"
-offer_install bat bat install_bat "needed at runtime: https://github.com/sharkdp/bat/releases"
+install_tool delta install_delta required "diff renderer: https://github.com/dandavison/delta/releases"
+install_tool bat install_bat required "syntax highlighting: https://github.com/sharkdp/bat/releases"
 # On-demand tools (used by specific keys).
-offer_install rg ripgrep install_rg "used by search: https://github.com/BurntSushi/ripgrep/releases"
-offer_install fzf fzf install_fzf "used by the file/diff pickers: https://github.com/junegunn/fzf/releases"
-offer_install yazi yazi install_yazi "used by the yazi file picker: https://github.com/sxyazi/yazi/releases"
-offer_install lazygit lazygit install_lazygit "used by the lazygit shortcut: https://github.com/jesseduffield/lazygit/releases"
+install_tool ripgrep install_rg optional "used by search: https://github.com/BurntSushi/ripgrep/releases"
+install_tool fzf install_fzf optional "used by the file/diff pickers: https://github.com/junegunn/fzf/releases"
+install_tool yazi install_yazi optional "used by the yazi file picker: https://github.com/sxyazi/yazi/releases"
+install_tool lazygit install_lazygit optional "used by the lazygit shortcut: https://github.com/jesseduffield/lazygit/releases"
 
 # git has no convenient single-binary release — use the system package manager.
 command -v git >/dev/null 2>&1 ||

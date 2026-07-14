@@ -71,17 +71,17 @@ jobs:
         shell: bash
         env:
           SIDECAR_DEPS_ONLY: "1" # don't try to fetch a sidecar release
-          SIDECAR_INSTALL_DEPS: "1" # non-interactive: answer "yes"
-          SIDECAR_FORCE_DEPS: "1" # install even if the runner already has them
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          export SIDECAR_BIN_DIR="$RUNNER_TEMP/deps"
+          export SIDECAR_BIN_DIR="$RUNNER_TEMP/bin"
+          export SIDECAR_TOOLS_DIR="$RUNNER_TEMP/deps"
           sh scripts/install.sh
-          for bin in delta bat rg fzf yazi; do
-            "$SIDECAR_BIN_DIR/$bin" --version >/dev/null \
+          # Every bundled tool must land in the private tools dir, unconditionally.
+          for bin in delta bat rg fzf yazi lazygit; do
+            "$SIDECAR_TOOLS_DIR/$bin" --version >/dev/null \
               || { echo "::error::dependency install failed for $bin"; exit 1; }
-            echo "ok: $("$SIDECAR_BIN_DIR/$bin" --version | head -n1)"
+            echo "ok: $("$SIDECAR_TOOLS_DIR/$bin" --version | head -n1)"
           done
 
       - name: Package

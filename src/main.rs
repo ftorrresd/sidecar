@@ -46,6 +46,7 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
+    use_bundled_tools();
     ensure_tools()?;
 
     // Optional positional arg: a directory to start in.
@@ -58,6 +59,36 @@ fn real_main() -> Result<()> {
     let result = app::App::new(root).and_then(|mut a| a.run(&mut terminal));
     tui::restore()?;
     result
+}
+
+/// Prepend sidecar's private tool directory to `PATH` so it always spawns the
+/// copies the installer bundled there (delta, bat, yazi, fzf, ripgrep, lazygit),
+/// independent of — and taking precedence over — anything on the system PATH.
+/// The directory matches `SIDECAR_TOOLS_DIR` in `scripts/install.sh`.
+fn use_bundled_tools() {
+    let dir = match env::var_os("SIDECAR_TOOLS_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => {
+            let base = match env::var_os("XDG_DATA_HOME") {
+                Some(d) if !d.is_empty() => PathBuf::from(d),
+                _ => match env::var_os("HOME") {
+                    Some(h) => PathBuf::from(h).join(".local/share"),
+                    None => return,
+                },
+            };
+            base.join("sidecar").join("bin")
+        }
+    };
+    if !dir.is_dir() {
+        return;
+    }
+    let mut paths = vec![dir];
+    if let Some(existing) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    if let Ok(joined) = env::join_paths(paths) {
+        env::set_var("PATH", joined);
+    }
 }
 
 /// sidecar orchestrates external programs rather than reimplementing them, so
@@ -73,8 +104,8 @@ fn ensure_tools() -> Result<()> {
         .collect();
     if !missing.is_empty() {
         bail!(
-            "missing required tools: {}. On Arch: sudo pacman -S --needed git git-delta bat \
-             yazi ripgrep fzf lazygit",
+            "missing required tools: {}. Re-run the sidecar installer to (re)install the \
+             bundled dependencies; install git with your system package manager.",
             missing.join(", ")
         );
     }

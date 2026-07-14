@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::external::{self, Hit};
+use crate::external;
 use crate::git::{self, ChangedFile};
 use crate::notes::{self, Note, SelKind};
 use crate::render;
@@ -48,6 +48,12 @@ enum Focus {
 enum FileListMode {
     All,
     Changes,
+}
+
+#[derive(Clone, Copy)]
+enum SearchScope {
+    Project,
+    File,
 }
 
 impl FileListMode {
@@ -1709,29 +1715,35 @@ impl App {
         Ok(())
     }
 
-    /// Search the *diff* (added/removed lines): `/` over the whole project, `s`
-    /// over the current file.
+    /// fzf line search over the working tree. `/` (File) always searches the
+    /// current file; `s` (Project) searches the whole repository in `All` mode
+    /// or just the changed files in `Changes` mode.
     fn search(&mut self, terminal: &mut Tui, scope: SearchScope) -> Result<()> {
-        let raw = match scope {
-            SearchScope::Project => git::project_diff_raw(&self.root).unwrap_or_default(),
+        let (targets, prompt, header): (Vec<PathBuf>, &str, &str) = match scope {
             SearchScope::File => match &self.view {
-                View::File { path, .. } => self.current_file_raw_diff(&path.to_string_lossy()),
+                View::File { path, .. } => (vec![path.clone()], "file> ", "current file"),
                 View::Home => {
-                    self.message = "Select a file first to search its diff.".into();
+                    self.message = "Select a file first to search it.".into();
                     return Ok(());
+                }
+            },
+            SearchScope::Project => match self.file_list_mode {
+                FileListMode::All => (Vec::new(), "project> ", "all repository lines"),
+                FileListMode::Changes => {
+                    let changed: Vec<PathBuf> =
+                        self.files.iter().map(|f| PathBuf::from(&f.path)).collect();
+                    if changed.is_empty() {
+                        self.message = "No changed files to search.".into();
+                        return Ok(());
+                    }
+                    (changed, "changed> ", "changed files")
                 }
             },
         };
 
-        let index = git::index_diff(&raw);
-        if index.trim().is_empty() {
-            self.message = "No changed lines to search.".into();
-            return Ok(());
-        }
-
         let root = self.root.clone();
-        let result: Result<Option<Hit>> =
-            tui::suspend(terminal, || external::search_diff(&root, &index))?;
+        let result =
+            tui::suspend(terminal, || external::search_content(&root, &targets, prompt, header))?;
 
         match result {
             Ok(Some(hit)) => self.open_path(hit.path, hit.line),
@@ -1739,21 +1751,6 @@ impl App {
             Err(e) => self.message = format!("search: {e}"),
         }
         Ok(())
-    }
-
-    /// Raw unified diff for one file (tracked change or untracked new file).
-    fn current_file_raw_diff(&self, rel: &str) -> String {
-        if git::is_tracked(&self.root, rel) {
-            if matches!(git::file_has_diff(&self.root, rel), Ok(true)) {
-                git::file_diff_raw(&self.root, rel).unwrap_or_default()
-            } else {
-                String::new()
-            }
-        } else if self.root.join(rel).is_file() {
-            git::untracked_diff_raw(&self.root, rel)
-        } else {
-            String::new()
-        }
     }
 
     // ---- Drawing --------------------------------------------------------
@@ -2054,7 +2051,8 @@ impl App {
             ("", ""),
             ("e", "open current file/hunk in $EDITOR"),
             ("z / y / f", "lazygit / yazi / fzf"),
-            ("s / /", "search project / current-file diff"),
+            ("s", "fzf search repo (All) or changed files (Changes)"),
+            ("/", "fzf search the current file"),
             ("r / R", "refresh now / toggle auto-refresh"),
             ("?", "toggle this help"),
             ("Ctrl+Z", "suspend sidecar to the background"),
@@ -2089,11 +2087,6 @@ impl App {
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(lines).block(block), area);
     }
-}
-
-enum SearchScope {
-    Project,
-    File,
 }
 
 /// Split a full-screen rect into (list, preview, footer).

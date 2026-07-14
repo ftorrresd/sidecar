@@ -60,21 +60,44 @@ pub fn pick_file_fzf(root: &Path) -> Result<Option<PathBuf>> {
     Ok(first_path(&sel).map(|p| relativize(root, &p)))
 }
 
-/// Interactive search over a prebuilt diff index (`path:line:col:text` records,
-/// one per changed line). Filtering runs ripgrep over the index file, so the
-/// results plug straight into the shared `path:line:col:text` parsing.
-pub fn search_diff(root: &Path, index: &str) -> Result<Option<Hit>> {
-    let mut tmp = NamedTempFile::new().context("failed to create temp file")?;
-    tmp.write_all(index.as_bytes())
-        .context("failed to write diff index")?;
-    // `--no-line-number --no-filename` keeps ripgrep from adding its own prefix,
-    // so each matching line is emitted verbatim as `path:line:col:text`.
-    let cmd = format!(
-        "rg --color=always --smart-case --no-line-number --no-filename -- {{q}} {} || true",
-        shell_quote(tmp.path())
-    );
-    // `tmp` stays alive until the (synchronous) fzf call returns.
-    reload_search(root, &cmd)
+/// Dump every line of `targets` (empty = the whole repository) as
+/// `path:line:col:text` records with ripgrep and let fzf fuzzy-filter them.
+/// `prompt`/`scope` label the fzf prompt and header.
+pub fn search_content(
+    root: &Path,
+    targets: &[PathBuf],
+    prompt: &str,
+    scope: &str,
+) -> Result<Option<Hit>> {
+    let mut cmd = Command::new("rg");
+    cmd.args([
+        "--color=never",
+        "--line-number",
+        "--column",
+        "--no-heading",
+        "--with-filename",
+        "--hidden",
+        "--glob",
+        "!.git",
+        "--",
+        ".",
+    ]);
+    if targets.is_empty() {
+        cmd.arg(".");
+    } else {
+        for target in targets {
+            cmd.arg(target);
+        }
+    }
+    let mut rg = cmd
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to run ripgrep")?;
+    let input = rg.stdout.take().context("ripgrep stdout unavailable")?;
+    let result = run_search(root, Stdio::from(input), prompt, scope);
+    let _ = rg.wait();
+    result
 }
 
 /// Open lazygit rooted at `root`.
@@ -142,40 +165,40 @@ fn try_copy(prog: &str, args: &[&str], text: &str) -> bool {
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
-/// Shared fzf-in-reload-mode search used by `search_project`/`search_file`.
-fn reload_search(root: &Path, reload_cmd: &str) -> Result<Option<Hit>> {
+fn run_search(root: &Path, input: Stdio, prompt: &str, scope: &str) -> Result<Option<Hit>> {
+    let header = format!("{scope} · Type a pattern · Enter jump · Esc cancel");
     let out = Command::new("fzf")
         .current_dir(root)
         .args([
             "--ansi",
-            "--disabled",
             "--delimiter=:",
             "--with-nth=1,2,4..",
-            "--prompt=search> ",
-            "--header=Type a pattern · Enter jump · Esc cancel",
-            &format!("--bind=start:reload:{reload_cmd}"),
-            &format!("--bind=change:reload:sleep 0.05; {reload_cmd}"),
+            &format!("--prompt={prompt}"),
+            &format!("--header={header}"),
             "--preview=bat --color=always --style=numbers --highlight-line {2} {1}",
             "--preview-window=right,60%,border-left,+{2}/2",
         ])
-        .stdin(Stdio::null())
+        .stdin(input)
         .stdout(Stdio::piped())
         .output()
         .context("failed to run fzf")?;
 
     let sel = String::from_utf8_lossy(&out.stdout);
-    let Some(line) = sel.lines().next().filter(|l| !l.is_empty()) else {
+    let Some(line) = sel.lines().next().filter(|line| !line.is_empty()) else {
         return Ok(None);
     };
-    // Format: path:line:col:text
     let mut parts = line.splitn(4, ':');
     let path = parts.next().unwrap_or_default();
-    let lineno = parts.next().and_then(|s| s.parse::<usize>().ok());
+    let lineno = parts.next().and_then(|value| value.parse::<usize>().ok());
     if path.is_empty() {
         return Ok(None);
     }
+    let path = PathBuf::from(path)
+        .strip_prefix("./")
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| PathBuf::from(path));
     Ok(Some(Hit {
-        path: relativize(root, &PathBuf::from(path)),
+        path: relativize(root, &path),
         line: lineno,
     }))
 }
@@ -196,10 +219,4 @@ fn relativize(root: &Path, path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
-}
-
-/// Minimal POSIX single-quote escaping for embedding a path in a shell command.
-fn shell_quote(path: &Path) -> String {
-    let s = path.to_string_lossy();
-    format!("'{}'", s.replace('\'', "'\\''"))
 }

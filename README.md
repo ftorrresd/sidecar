@@ -67,8 +67,8 @@ Press `?` at any time for this list in-app.
 | `e`         | Open the current file/hunk in `$EDITOR`            |
 | `y`         | Open **yazi** to pick any file                     |
 | `f`         | **fzf** over all filenames (`rg --files`)          |
-| `s`         | Search the **project diff** (added/removed lines)  |
-| `/`         | Search the **current file's diff**                 |
+| `s`         | **fzf** search project: all lines or changed lines by list mode |
+| `/`         | **fzf** search current file: all lines or changed lines by list mode |
 | `r`         | Refresh now                                        |
 | `R`         | Toggle auto-refresh (off by default)               |
 | `z`         | Open **lazygit**                                   |
@@ -127,8 +127,9 @@ sidecar skill path   # prints e.g. /tmp/sidecar-notes-skill
 **Auto** diff layout uses side-by-side when the preview is at least 120 columns
 wide, and stacked (unified) below that.
 
-**Search** (`/` and `s`) is diff-aware: it searches only the added/removed lines
-of the diff, and jumps to the matching file and line.
+Search uses **fzf**: `s` searches the whole project and `/` searches the current
+file. In **All** mode it searches full file contents; in **Changes** mode it
+searches only added and removed diff lines.
 
 **Mouse:** click a file to select it, click a panel to focus it, and scroll the
 wheel to move the selection (over the list) or scroll (over the preview).

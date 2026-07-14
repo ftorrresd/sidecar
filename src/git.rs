@@ -216,69 +216,6 @@ pub fn untracked_diff_raw(root: &Path, path: &str) -> String {
     no_index_diff(root, path)
 }
 
-/// Build a searchable index of the *changed* lines of a raw unified diff.
-///
-/// Each added or removed line becomes one `path:line:col:text` record — the
-/// same shape fzf/ripgrep produce — so diff search plugs into the existing
-/// jump-to-file flow. `line` is the new-file line number (removed lines point
-/// at where they were deleted). Context lines are omitted so the search only
-/// covers what actually changed.
-pub fn index_diff(raw: &str) -> String {
-    let mut out = String::new();
-    let mut path = String::new();
-    let mut new_line: usize = 0;
-
-    for line in raw.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            path = normalize_diff_path(rest);
-        } else if line.starts_with("--- ") || line.starts_with("diff ") {
-            // Header lines; nothing to index.
-        } else if let Some(rest) = line.strip_prefix("@@") {
-            // @@ -a,b +c,d @@ — grab the new-file start line `c`.
-            new_line = parse_hunk_new_start(rest);
-        } else if let Some(text) = line.strip_prefix('+') {
-            if !path.is_empty() {
-                out.push_str(&format!("{path}:{new_line}:1:+{text}\n"));
-            }
-            new_line += 1;
-        } else if let Some(text) = line.strip_prefix('-') {
-            if !path.is_empty() {
-                out.push_str(&format!("{path}:{new_line}:1:-{text}\n"));
-            }
-            // Removed line: the new-file cursor does not advance.
-        } else if line.starts_with(' ') {
-            new_line += 1;
-        }
-    }
-    out
-}
-
-/// Turn a diff path token into a clean, repo-relative path.
-///
-/// Strips the diff prefix — standard `a/`,`b/` or git's mnemonic `c/`,`i/`,`w/`,
-/// `o/` (used when `diff.mnemonicPrefix` is enabled) — and drops `/dev/null`.
-fn normalize_diff_path(token: &str) -> String {
-    let t = token.trim();
-    if t == "/dev/null" {
-        return String::new();
-    }
-    for prefix in ["a/", "b/", "c/", "i/", "w/", "o/"] {
-        if let Some(rest) = t.strip_prefix(prefix) {
-            return rest.to_string();
-        }
-    }
-    t.to_string()
-}
-
-/// Parse the new-file start line from a hunk header body like ` -1,4 +2,6 @@ ...`.
-fn parse_hunk_new_start(rest: &str) -> usize {
-    rest.split('+')
-        .nth(1)
-        .and_then(|s| s.split([',', ' ']).next())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(1)
-}
-
 /// Render an untracked file as a `git diff --no-index` addition.
 ///
 /// This intentionally ignores the exit status: `--no-index` returns 1 whenever
@@ -297,39 +234,6 @@ fn no_index_diff(root: &Path, path: &str) -> String {
 mod tests {
     use super::*;
     use std::fs;
-
-    #[test]
-    fn index_diff_records_added_and_removed_with_new_line_numbers() {
-        let raw = "\
-diff --git a/src/x.rs b/src/x.rs
---- a/src/x.rs
-+++ b/src/x.rs
-@@ -1,3 +1,4 @@
- fn main() {
--    let a = 1;
-+    let a = 2;
-+    let b = 3;
- }
-";
-        let index = index_diff(raw);
-        let lines: Vec<&str> = index.lines().collect();
-        assert_eq!(
-            lines,
-            vec![
-                // removed line keeps the new-file cursor (line 2)
-                "src/x.rs:2:1:-    let a = 1;",
-                // added lines advance from line 2
-                "src/x.rs:2:1:+    let a = 2;",
-                "src/x.rs:3:1:+    let b = 3;",
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_hunk_new_start_reads_the_plus_side() {
-        assert_eq!(parse_hunk_new_start(" -1,3 +5,6 @@ fn foo()"), 5);
-        assert_eq!(parse_hunk_new_start(" -0,0 +1 @@"), 1);
-    }
 
     #[test]
     fn all_files_includes_tracked_and_untracked_but_not_ignored() {
